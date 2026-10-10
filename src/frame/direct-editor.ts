@@ -96,7 +96,6 @@ export const createDirectEditor = ({ bar, host, toolbar, onToggle }: DirectEdito
     show,
     visible: () => row.hidden === false,
     label(t: FrameContext['t']) {
-      edit.title = t.directEdit;
       edit.setAttribute('aria-label', t.directEdit);
       label.textContent = t.directLabel;
       input.placeholder = t.directPlaceholder;
