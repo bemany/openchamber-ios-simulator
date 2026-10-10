@@ -8,6 +8,8 @@ export type Device = {
   /** For example `iOS 27.0`. */
   runtime: string;
   state: DeviceState;
+  /** `com.apple.CoreSimulator.SimDeviceType.iPhone-18-Pro`, for the device frame. */
+  deviceType?: string;
 };
 
 export type Orientation = 'portrait' | 'portrait_upside_down' | 'landscape_left' | 'landscape_right';
@@ -33,6 +35,42 @@ export type SimState = {
   orientation: Orientation | null;
   appearance: Appearance;
   keyboard: KeyboardLayout | null;
+  /** The device frame is drawn around the picture (when Xcode has one for the device). */
+  framed: boolean;
   /** Last error for display, or `null`. */
   error: string | null;
 };
+
+export type Rect = { x: number; y: number; width: number; height: number };
+
+/** A hardware button on the device frame, in frame pixels (portrait). */
+export type ChromeButton = Rect & { name: string; page: number; usage: number };
+
+/**
+ * Xcode's device frame for one device, laid out in framebuffer pixels:
+ * `width`/`height` is the whole picture, `screen` where the framebuffer sits.
+ */
+export type ChromeLayout = {
+  id: string;
+  width: number;
+  height: number;
+  screen: Rect;
+  buttons: ChromeButton[];
+};
+
+/**
+ * Something too big for one `serviceRequest` answer (the host cuts those at
+ * 256 000 characters): base64 fetched in parts from `GET /blob?id=&offset=`.
+ */
+export type BlobRef = { id: string; length: number };
+
+/** Characters per `GET /blob` answer, below the host's limit. */
+export const BLOB_CHUNK = 240_000;
+
+/** `GET /chrome`: the frame for the page, which draws it itself. Images are base64 PNG. */
+export type ChromeAnswer =
+  | { available: false }
+  | { available: true; layout: ChromeLayout; layer: BlobRef; mask: BlobRef | null };
+
+/** `GET /page/frame`: one raw framebuffer picture for the page. */
+export type PageFrame = { seq: number; mime: string; width: number; height: number; degrees: number; data: BlobRef };

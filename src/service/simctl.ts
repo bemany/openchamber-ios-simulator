@@ -8,7 +8,7 @@ import type { Appearance, Device, KeyboardLayout } from '../shared/state.ts';
 import { run, XCRUN } from './exec.ts';
 import { layoutFromKeyboards } from './keymap.ts';
 
-type ListJson = { devices?: Record<string, Array<{ udid?: string; name?: string; state?: string; isAvailable?: boolean }>> };
+type ListJson = { devices?: Record<string, Array<{ udid?: string; name?: string; state?: string; isAvailable?: boolean; deviceTypeIdentifier?: string }>> };
 
 /** `com.apple.CoreSimulator.SimRuntime.iOS-27-1` becomes `iOS 27.1`. */
 export const runtimeLabel = (key: string): string => {
@@ -37,7 +37,13 @@ export const parseDevices = (json: string): Device[] => {
     for (const device of parsed.devices?.[runtime] ?? []) {
       if (!device.udid || !device.name || device.isAvailable === false) continue;
       if (!/^(iPhone|iPad)\b/.test(device.name)) continue;
-      devices.push({ udid: device.udid, name: device.name, runtime: runtimeLabel(runtime), state: device.state ?? 'Shutdown' });
+      devices.push({
+        udid: device.udid,
+        name: device.name,
+        runtime: runtimeLabel(runtime),
+        state: device.state ?? 'Shutdown',
+        ...(device.deviceTypeIdentifier ? { deviceType: device.deviceTypeIdentifier } : {}),
+      });
     }
   }
   return devices;
@@ -54,6 +60,23 @@ export const listDevices = async (): Promise<Device[]> => {
   const result = await run(XCRUN, ['simctl', 'list', 'devices', '-j']);
   if (!result.ok) throw new Error(`simctl list: ${result.stderr || 'xcrun not found'}`);
   return parseDevices(result.stdout);
+};
+
+/** Bundle folder of every device type, by identifier. */
+export const listDeviceTypes = async (): Promise<Map<string, string>> => {
+  const result = await run(XCRUN, ['simctl', 'list', 'devicetypes', '-j']);
+  if (!result.ok) throw new Error(`simctl list devicetypes: ${result.stderr || 'xcrun not found'}`);
+  const parsed = JSON.parse(result.stdout) as { devicetypes?: Array<{ identifier?: string; bundlePath?: string }> };
+  const types = new Map<string, string>();
+  for (const type of parsed.devicetypes ?? []) if (type.identifier && type.bundlePath) types.set(type.identifier, type.bundlePath);
+  return types;
+};
+
+/** A binary plist as JSON, through `plutil` (found by `xcrun`, so no extra program to approve). */
+export const readPlist = async (file: string): Promise<unknown> => {
+  const result = await run(XCRUN, ['plutil', '-convert', 'json', '-o', '-', file], { timeout: 5_000 });
+  if (!result.ok) throw new Error(result.stderr.trim() || `Could not read ${file}`);
+  return JSON.parse(result.stdout) as unknown;
 };
 
 export const bootDevice = async (udid: string): Promise<void> => {

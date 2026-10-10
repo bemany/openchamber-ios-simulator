@@ -38,6 +38,10 @@
         "dock": "top",
         "size": 44
       },
+      "page": {
+        "entry": "dist/page/index.html",
+        "title": "iOS Simulator"
+      },
       "statusSection": {
         "entry": "dist/status/index.html",
         "title": "iOS Simulator",
@@ -58,9 +62,11 @@
     }
   },
   "devDependencies": {
+    "@jsquash/jpeg": "^1.6.0",
     "@openchamber/sdk": "^2.2.0",
     "@types/bun": "^1.4.2",
     "@types/node": "^26.6.4",
+    "jpeg-js": "^0.4.4",
     "typescript": "^7.0.2"
   }
 }

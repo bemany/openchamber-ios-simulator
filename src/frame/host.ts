@@ -1,4 +1,4 @@
-import { connectHost, HostRequestError, type HostClient } from '@openchamber/sdk';
+import { connectHost, HostRequestError, type HostClient, type HostReadyContext } from '@openchamber/sdk';
 import { applyHostReady } from '@openchamber/sdk/ui';
 
 import type { SimState } from '../shared/state.ts';
@@ -46,8 +46,10 @@ const errorText = (body: string): string => {
   }
 };
 
-/** Wiring shared by both frames: theme and locale from the host, `/state` polling while visible, redraw on change. */
-export const startFrame = (render: (context: FrameContext) => void): HostClient => {
+export type FrameOptions = { onReady?: (context: HostReadyContext) => void };
+
+/** Wiring shared by the frames: theme and locale from the host, `/state` polling while visible, redraw on change. */
+export const startFrame = (render: (context: FrameContext) => void, options: FrameOptions = {}): HostClient => {
   const host = connectHost();
   let view: ViewState = { kind: 'loading' };
   let t = messagesFor(navigator.language || 'en');
@@ -99,6 +101,7 @@ export const startFrame = (render: (context: FrameContext) => void): HostClient 
     applyHostReady(context, document.documentElement);
     t = messagesFor(context.locale);
     document.documentElement.lang = context.locale;
+    options.onReady?.(context);
     draw();
   });
 

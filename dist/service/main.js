@@ -211,6 +211,237 @@ var readSurfaceControlNotice = (body) => {
     notice.viewer = viewer;
   return notice;
 };
+// src/shared/state.ts
+var BLOB_CHUNK = 240000;
+
+// src/service/chrome.ts
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { mkdir, readFile as readFile2, rename } from "node:fs/promises";
+import { tmpdir as tmpdir2 } from "node:os";
+import { join as join2 } from "node:path";
+
+// src/service/compose.ts
+var drawOver = (target, source, x, y) => {
+  for (let row = 0;row < source.height; row += 1) {
+    const ty = y + row;
+    if (ty < 0 || ty >= target.height)
+      continue;
+    for (let column = 0;column < source.width; column += 1) {
+      const tx = x + column;
+      if (tx < 0 || tx >= target.width)
+        continue;
+      const from = (row * source.width + column) * 4;
+      const alpha = source.data[from + 3];
+      if (alpha === 0)
+        continue;
+      const to = (ty * target.width + tx) * 4;
+      if (alpha === 255) {
+        target.data.set(source.data.subarray(from, from + 4), to);
+        continue;
+      }
+      const a = alpha / 255;
+      const below = target.data[to + 3] / 255;
+      const out = a + below * (1 - a);
+      for (let channel = 0;channel < 3; channel += 1) {
+        const mixed = (source.data[from + channel] * a + target.data[to + channel] * below * (1 - a)) / out;
+        target.data[to + channel] = Math.round(mixed);
+      }
+      target.data[to + 3] = Math.round(out * 255);
+    }
+  }
+};
+var fillRect = (target, rect, rgba) => {
+  const x0 = Math.max(0, Math.round(rect.x));
+  const y0 = Math.max(0, Math.round(rect.y));
+  const x1 = Math.min(target.width, Math.round(rect.x + rect.width));
+  const y1 = Math.min(target.height, Math.round(rect.y + rect.height));
+  for (let y = y0;y < y1; y += 1) {
+    for (let x = x0;x < x1; x += 1)
+      target.data.set(rgba, (y * target.width + x) * 4);
+  }
+};
+var parseColor = (value, fallback) => {
+  if (typeof value !== "string")
+    return fallback;
+  const hex = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(value.trim())?.[1];
+  if (!hex)
+    return fallback;
+  const full = hex.length === 3 ? [...hex].map((digit) => digit + digit).join("") : hex;
+  return [0, 2, 4].map((index) => parseInt(full.slice(index, index + 2), 16));
+};
+var flatten = (layer, background) => {
+  const data = new Uint8Array(layer.data.length);
+  for (let index = 0;index < data.length; index += 4) {
+    const a = layer.data[index + 3] / 255;
+    for (let channel = 0;channel < 3; channel += 1) {
+      data[index + channel] = Math.round(layer.data[index + channel] * a + background[channel] * (1 - a));
+    }
+    data[index + 3] = 255;
+  }
+  return { width: layer.width, height: layer.height, data };
+};
+
+// src/service/exec.ts
+import { execFile } from "node:child_process";
+import { dirname } from "node:path";
+var childEnv = () => {
+  const extra = ["/opt/homebrew/bin", "/usr/local/bin", dirname(process.execPath)];
+  const path = [...(process.env.PATH ?? "").split(":").filter(Boolean)];
+  for (const dir of extra)
+    if (!path.includes(dir))
+      path.push(dir);
+  return { ...process.env, PATH: path.join(":") };
+};
+var run = async (commands, args, options = {}) => {
+  let last = { ok: false, missing: true, stderr: "" };
+  for (const command of commands) {
+    last = await new Promise((resolve) => {
+      const child = execFile(command, args, { timeout: options.timeout ?? 15000, env: childEnv(), maxBuffer: 32 * 1024 * 1024 }, (error, stdout, stderr) => {
+        if (!error)
+          resolve({ ok: true, stdout });
+        else
+          resolve({ ok: false, missing: "code" in error && error.code === "ENOENT", stderr: String(stderr || error.message) });
+      });
+      if (options.input !== undefined)
+        child.stdin?.end(options.input);
+    });
+    if (last.ok || !last.missing)
+      return last;
+  }
+  return last;
+};
+var XCRUN = ["/usr/bin/xcrun", "xcrun"];
+var SERVE_SIM = ["/opt/homebrew/bin/serve-sim", "/usr/local/bin/serve-sim", "serve-sim"];
+
+// src/service/png.ts
+import { deflateSync, inflateSync } from "node:zlib";
+var SIGNATURE = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+var CHANNELS = { 0: 1, 2: 3, 4: 2, 6: 4 };
+var paeth = (a, b, c) => {
+  const p = a + b - c;
+  const pa = Math.abs(p - a);
+  const pb = Math.abs(p - b);
+  const pc = Math.abs(p - c);
+  return pa <= pb && pa <= pc ? a : pb <= pc ? b : c;
+};
+var decodePng = (png) => {
+  if (png.length < 8 || !png.subarray(0, 8).equals(SIGNATURE))
+    throw new Error("Not a PNG");
+  let width = 0;
+  let height = 0;
+  let channels = 0;
+  const idat = [];
+  for (let offset = 8;offset + 8 <= png.length; ) {
+    const length = png.readUInt32BE(offset);
+    const type = png.toString("latin1", offset + 4, offset + 8);
+    const body = png.subarray(offset + 8, offset + 8 + length);
+    if (type === "IHDR") {
+      width = body.readUInt32BE(0);
+      height = body.readUInt32BE(4);
+      const depth = body[8];
+      channels = CHANNELS[body[9] ?? -1] ?? 0;
+      if (depth !== 8 || !channels || body[12] !== 0)
+        throw new Error("Unsupported PNG (8-bit, non-interlaced only)");
+    } else if (type === "IDAT")
+      idat.push(body);
+    else if (type === "IEND")
+      break;
+    offset += 12 + length;
+  }
+  if (!width || !height)
+    throw new Error("PNG without a header");
+  const raw = inflateSync(Buffer.concat(idat));
+  const stride = width * channels;
+  const lines = new Uint8Array(height * stride);
+  let previous = new Uint8Array(stride);
+  for (let y = 0;y < height; y += 1) {
+    const filter = raw[y * (stride + 1)];
+    const line = lines.subarray(y * stride, (y + 1) * stride);
+    line.set(raw.subarray(y * (stride + 1) + 1, (y + 1) * (stride + 1)));
+    for (let x = 0;x < stride; x += 1) {
+      const left = x >= channels ? line[x - channels] : 0;
+      const up = previous[x];
+      const corner = x >= channels ? previous[x - channels] : 0;
+      switch (filter) {
+        case 1:
+          line[x] = line[x] + left & 255;
+          break;
+        case 2:
+          line[x] = line[x] + up & 255;
+          break;
+        case 3:
+          line[x] = line[x] + (left + up >> 1) & 255;
+          break;
+        case 4:
+          line[x] = line[x] + paeth(left, up, corner) & 255;
+          break;
+      }
+    }
+    previous = line;
+  }
+  if (channels === 4)
+    return { width, height, data: lines };
+  const data = new Uint8Array(width * height * 4);
+  for (let index = 0;index < width * height; index += 1) {
+    const from = index * channels;
+    const to = index * 4;
+    const grey = channels <= 2;
+    data[to] = lines[from];
+    data[to + 1] = grey ? lines[from] : lines[from + 1];
+    data[to + 2] = grey ? lines[from] : lines[from + 2];
+    data[to + 3] = channels === 2 ? lines[from + 1] : channels === 4 ? lines[from + 3] : 255;
+  }
+  return { width, height, data };
+};
+var CRC_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0;n < 256; n += 1) {
+    let c = n;
+    for (let k = 0;k < 8; k += 1)
+      c = c & 1 ? 3988292384 ^ c >>> 1 : c >>> 1;
+    table[n] = c >>> 0;
+  }
+  return table;
+})();
+var crc32 = (bytes) => {
+  let c = 4294967295;
+  for (const byte of bytes)
+    c = CRC_TABLE[(c ^ byte) & 255] ^ c >>> 8;
+  return (c ^ 4294967295) >>> 0;
+};
+var chunk = (type, body) => {
+  const head = Buffer.alloc(8);
+  head.writeUInt32BE(body.length, 0);
+  head.write(type, 4, "latin1");
+  const crc = Buffer.alloc(4);
+  crc.writeUInt32BE(crc32(Buffer.concat([head.subarray(4), body])), 0);
+  return Buffer.concat([head, body, crc]);
+};
+var encodePng = ({ width, height, data }) => {
+  const stride = width * 4;
+  const raw = Buffer.alloc(height * (stride + 1));
+  for (let y = 0;y < height; y += 1) {
+    const out = y * (stride + 1);
+    raw[out] = 2;
+    for (let x = 0;x < stride; x += 1) {
+      const value = data[y * stride + x];
+      const up = y > 0 ? data[(y - 1) * stride + x] : 0;
+      raw[out + 1 + x] = value - up & 255;
+    }
+  }
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(width, 0);
+  header.writeUInt32BE(height, 4);
+  header[8] = 8;
+  header[9] = 6;
+  return Buffer.concat([SIGNATURE, chunk("IHDR", header), chunk("IDAT", deflateSync(raw, { level: 6 })), chunk("IEND", new Uint8Array(0))]);
+};
+
+// src/service/simctl.ts
+import { readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
 // src/service/keymap.ts
 var HID = {
   enter: 40,
@@ -346,44 +577,338 @@ var typeText = (text, layout = "us") => {
   return { events, skipped };
 };
 
-// src/service/rotate.ts
-import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-
-// src/service/exec.ts
-import { execFile } from "node:child_process";
-import { dirname } from "node:path";
-var childEnv = () => {
-  const extra = ["/opt/homebrew/bin", "/usr/local/bin", dirname(process.execPath)];
-  const path = [...(process.env.PATH ?? "").split(":").filter(Boolean)];
-  for (const dir of extra)
-    if (!path.includes(dir))
-      path.push(dir);
-  return { ...process.env, PATH: path.join(":") };
+// src/service/simctl.ts
+var runtimeLabel = (key) => {
+  const tail = key.split(".").pop() ?? key;
+  const match = /^([A-Za-z]+)-(\d+)-(\d+)$/.exec(tail);
+  return match ? `${match[1]} ${match[2]}.${match[3]}` : tail;
 };
-var run = async (commands, args, options = {}) => {
-  let last = { ok: false, missing: true, stderr: "" };
-  for (const command of commands) {
-    last = await new Promise((resolve) => {
-      const child = execFile(command, args, { timeout: options.timeout ?? 15000, env: childEnv(), maxBuffer: 32 * 1024 * 1024 }, (error, stdout, stderr) => {
-        if (!error)
-          resolve({ ok: true, stdout });
-        else
-          resolve({ ok: false, missing: "code" in error && error.code === "ENOENT", stderr: String(stderr || error.message) });
+var runtimeVersion = (key) => (/iOS-(\d+)-(\d+)/.exec(key) ?? []).slice(1).map(Number);
+var parseDevices = (json) => {
+  const parsed = JSON.parse(json);
+  const runtimes = Object.keys(parsed.devices ?? {}).filter((key) => /SimRuntime\.iOS-/.test(key)).sort((a, b) => {
+    const [aMajor = 0, aMinor = 0] = runtimeVersion(a);
+    const [bMajor = 0, bMinor = 0] = runtimeVersion(b);
+    return bMajor - aMajor || bMinor - aMinor;
+  });
+  const devices = [];
+  for (const runtime of runtimes) {
+    for (const device of parsed.devices?.[runtime] ?? []) {
+      if (!device.udid || !device.name || device.isAvailable === false)
+        continue;
+      if (!/^(iPhone|iPad)\b/.test(device.name))
+        continue;
+      devices.push({
+        udid: device.udid,
+        name: device.name,
+        runtime: runtimeLabel(runtime),
+        state: device.state ?? "Shutdown",
+        ...device.deviceTypeIdentifier ? { deviceType: device.deviceTypeIdentifier } : {}
       });
-      if (options.input !== undefined)
-        child.stdin?.end(options.input);
-    });
-    if (last.ok || !last.missing)
-      return last;
+    }
   }
-  return last;
+  return devices;
 };
-var XCRUN = ["/usr/bin/xcrun", "xcrun"];
-var SERVE_SIM = ["/opt/homebrew/bin/serve-sim", "/usr/local/bin/serve-sim", "serve-sim"];
+var defaultDevice = (devices) => devices.find((device) => /^iPhone \d/.test(device.name)) ?? devices.find((device) => device.name.startsWith("iPhone")) ?? devices[0] ?? null;
+var listDevices = async () => {
+  const result = await run(XCRUN, ["simctl", "list", "devices", "-j"]);
+  if (!result.ok)
+    throw new Error(`simctl list: ${result.stderr || "xcrun not found"}`);
+  return parseDevices(result.stdout);
+};
+var listDeviceTypes = async () => {
+  const result = await run(XCRUN, ["simctl", "list", "devicetypes", "-j"]);
+  if (!result.ok)
+    throw new Error(`simctl list devicetypes: ${result.stderr || "xcrun not found"}`);
+  const parsed = JSON.parse(result.stdout);
+  const types = new Map;
+  for (const type of parsed.devicetypes ?? [])
+    if (type.identifier && type.bundlePath)
+      types.set(type.identifier, type.bundlePath);
+  return types;
+};
+var readPlist = async (file) => {
+  const result = await run(XCRUN, ["plutil", "-convert", "json", "-o", "-", file], { timeout: 5000 });
+  if (!result.ok)
+    throw new Error(result.stderr.trim() || `Could not read ${file}`);
+  return JSON.parse(result.stdout);
+};
+var bootDevice = async (udid) => {
+  const boot = await run(XCRUN, ["simctl", "boot", udid], { timeout: 120000 });
+  if (!boot.ok && !/current state: Booted/i.test(boot.stderr))
+    throw new Error(boot.stderr.trim() || "Boot failed");
+  await run(XCRUN, ["simctl", "bootstatus", udid], { timeout: 180000 });
+};
+var shutdownDevice = async (udid) => {
+  const result = await run(XCRUN, ["simctl", "shutdown", udid], { timeout: 60000 });
+  if (!result.ok && !/current state: Shutdown/i.test(result.stderr))
+    throw new Error(result.stderr.trim() || "Shutdown failed");
+};
+var readAppearance = async (udid) => {
+  const result = await run(XCRUN, ["simctl", "ui", udid, "appearance"], { timeout: 5000 });
+  if (!result.ok)
+    return "unknown";
+  const value = result.stdout.trim();
+  return value === "light" || value === "dark" ? value : "unknown";
+};
+var setAppearance = async (udid, appearance) => {
+  const result = await run(XCRUN, ["simctl", "ui", udid, "appearance", appearance], { timeout: 1e4 });
+  if (!result.ok)
+    throw new Error(result.stderr.trim() || "Could not set the appearance");
+};
+var readKeyboardLayout = async (udid) => {
+  const result = await run(XCRUN, ["simctl", "spawn", udid, "defaults", "read", "-g", "AppleKeyboards"], { timeout: 1e4 });
+  return result.ok ? layoutFromKeyboards(result.stdout) : "us";
+};
+var screenshot = async (udid) => {
+  const file = join(tmpdir(), `oc-ios-sim-${process.pid}-${Date.now()}.png`);
+  try {
+    const result = await run(XCRUN, ["simctl", "io", udid, "screenshot", "--type=png", file], { timeout: 20000 });
+    if (!result.ok)
+      throw new Error(result.stderr.trim() || "Screenshot failed");
+    return await readFile(file);
+  } finally {
+    await rm(file, { force: true });
+  }
+};
+
+// src/service/chrome.ts
+var CHROME_ROOT = "/Library/Developer/DeviceKit/Chrome";
+var CACHE = join2(tmpdir2(), "oc-ios-sim-chrome");
+var SIPS = ["/usr/bin/sips", "sips"];
+var CHROME_PREFIX = "com.apple.dt.devicekit.chrome.";
+var record = (value) => value && typeof value === "object" && !Array.isArray(value) ? value : {};
+var num = (value, fallback = 0) => typeof value === "number" && Number.isFinite(value) ? value : fallback;
+var str = (value) => typeof value === "string" && value ? value : null;
+var point = (value) => {
+  const object = record(value);
+  return typeof object.x === "number" && typeof object.y === "number" ? { x: object.x, y: object.y } : null;
+};
+var parseDisplay = (plist) => {
+  const root = record(plist);
+  const capabilities = record(root.capabilities ?? root);
+  const displays = Array.isArray(capabilities.displays) ? capabilities.displays : [];
+  for (const entry of displays) {
+    const display = record(entry);
+    if (display.displayType !== "integrated" || display.hasDigitizer !== true)
+      continue;
+    const chrome = str(display.chromeIdentifier);
+    const width = num(display.width);
+    const height = num(display.height);
+    const scale = num(display.scale);
+    if (!chrome || width <= 0 || height <= 0 || scale <= 0)
+      continue;
+    return { width, height, scale, chrome: chrome.replace(CHROME_PREFIX, ""), mask: str(display.framebufferMaskIdentifier) };
+  }
+  return null;
+};
+var parseChromeJson = (json) => {
+  const root = record(json);
+  const images = record(root.images);
+  const sizing = record(images.sizing);
+  const padding = record(images.devicePadding);
+  const slices = {
+    topLeft: str(images.topLeft),
+    top: str(images.top),
+    topRight: str(images.topRight),
+    right: str(images.right),
+    bottomRight: str(images.bottomRight),
+    bottom: str(images.bottom),
+    bottomLeft: str(images.bottomLeft),
+    left: str(images.left)
+  };
+  const composite = str(images.composite);
+  const complete = Object.values(slices).every((value) => value !== null);
+  if (!composite && !complete)
+    return null;
+  const inputs = [];
+  for (const entry of Array.isArray(root.inputs) ? root.inputs : []) {
+    const input = record(entry);
+    const name = str(input.name);
+    const image = str(input.image);
+    if (!name || !image || input.type !== "button")
+      continue;
+    const offsets = record(input.offsets);
+    const normal = point(offsets.normal) ?? point(offsets.rollover) ?? { x: 0, y: 0 };
+    const rollover = point(offsets.rollover) ?? normal;
+    const anchor = input.anchor === "right" || input.anchor === "top" || input.anchor === "bottom" ? input.anchor : "left";
+    inputs.push({
+      name,
+      image,
+      anchor,
+      align: input.align === "trailing" || input.align === "center" ? input.align : "leading",
+      onTop: input.onTop === true,
+      normal,
+      rollover,
+      page: num(input.usagePage),
+      usage: num(input.usage)
+    });
+  }
+  return {
+    composite,
+    slices: complete ? slices : null,
+    sizing: { left: num(sizing.leftWidth), right: num(sizing.rightWidth), top: num(sizing.topHeight), bottom: num(sizing.bottomHeight) },
+    padding: { left: num(padding.left), right: num(padding.right), top: num(padding.top), bottom: num(padding.bottom) },
+    inputs
+  };
+};
+var pdfSize = (pdf) => {
+  const text = typeof pdf === "string" ? pdf : pdf.toString("latin1");
+  const box = /\/(?:CropBox|MediaBox)\s*\[\s*(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s+(-?[\d.]+)\s*\]/.exec(text);
+  if (!box)
+    return null;
+  const width = Math.abs(Number(box[3]) - Number(box[1]));
+  const height = Math.abs(Number(box[4]) - Number(box[2]));
+  return width > 0 && height > 0 ? { width, height } : null;
+};
+var planChrome = (id, display, spec, sizeOf) => {
+  const scale = display.scale;
+  const screen = { width: display.width / scale, height: display.height / scale };
+  const composite = spec.composite ? sizeOf(spec.composite) : null;
+  if (spec.composite && !composite && !spec.slices)
+    return null;
+  const body = composite ?? { width: screen.width + spec.sizing.left + spec.sizing.right, height: screen.height + spec.sizing.top + spec.sizing.bottom };
+  const bodyAt = { x: spec.padding.left, y: spec.padding.top };
+  const screenAt = composite ? { x: bodyAt.x + (body.width - screen.width) / 2, y: bodyAt.y + (body.height - screen.height) / 2 } : { x: bodyAt.x + spec.sizing.left, y: bodyAt.y + spec.sizing.top };
+  const under = [];
+  const over = [];
+  const buttons = [];
+  for (const input of spec.inputs) {
+    const size = sizeOf(input.image);
+    if (!size)
+      continue;
+    const g = { x: 2 * input.normal.x - input.rollover.x, y: 2 * input.normal.y - input.rollover.y };
+    const along = input.align === "trailing" ? bodyAt.x + body.width + g.x - size.width : input.align === "center" ? bodyAt.x + (body.width - size.width) / 2 + g.x : bodyAt.x + g.x;
+    const at = input.anchor === "left" ? { x: bodyAt.x + input.rollover.x - size.width / 2, y: bodyAt.y + input.rollover.y } : input.anchor === "right" ? { x: bodyAt.x + body.width + g.x, y: bodyAt.y + g.y } : input.anchor === "top" ? { x: along, y: bodyAt.y + g.y - size.height } : { x: along, y: bodyAt.y + body.height + g.y };
+    const rect = { ...at, ...size };
+    (input.onTop ? over : under).push({ image: input.image, rect });
+    if (input.page > 0 && input.usage > 0)
+      buttons.push({ name: input.name, page: input.page, usage: input.usage, rect });
+  }
+  const bodyPieces = [];
+  if (composite) {
+    bodyPieces.push({ image: spec.composite, rect: { ...bodyAt, ...composite } });
+  } else {
+    const slices = spec.slices;
+    const corner = (image) => sizeOf(image);
+    const tl = corner(slices.topLeft);
+    const tr = corner(slices.topRight);
+    const bl = corner(slices.bottomLeft);
+    const br = corner(slices.bottomRight);
+    const top = sizeOf(slices.top);
+    const bottom = sizeOf(slices.bottom);
+    const left = sizeOf(slices.left);
+    const right = sizeOf(slices.right);
+    if (!tl || !tr || !bl || !br || !top || !bottom || !left || !right)
+      return null;
+    const { x, y } = bodyAt;
+    const { width: w, height: h } = body;
+    bodyPieces.push({ fill: true, rect: { x: x + left.width, y: y + top.height, width: w - left.width - right.width, height: h - top.height - bottom.height } }, { image: slices.top, rect: { x: x + tl.width, y, width: w - tl.width - tr.width, height: top.height } }, { image: slices.bottom, rect: { x: x + bl.width, y: y + h - bottom.height, width: w - bl.width - br.width, height: bottom.height } }, { image: slices.left, rect: { x, y: y + tl.height, width: left.width, height: h - tl.height - bl.height } }, { image: slices.right, rect: { x: x + w - right.width, y: y + tr.height, width: right.width, height: h - tr.height - br.height } }, { image: slices.topLeft, rect: { x, y, ...tl } }, { image: slices.topRight, rect: { x: x + w - tr.width, y, ...tr } }, { image: slices.bottomLeft, rect: { x, y: y + h - bl.height, ...bl } }, { image: slices.bottomRight, rect: { x: x + w - br.width, y: y + h - br.height, ...br } });
+  }
+  const all = [...under, ...bodyPieces, ...over].map((piece) => piece.rect);
+  all.push({ x: 0, y: 0, width: body.width + spec.padding.left + spec.padding.right, height: body.height + spec.padding.top + spec.padding.bottom });
+  const minX = Math.min(...all.map((rect) => rect.x));
+  const minY = Math.min(...all.map((rect) => rect.y));
+  const maxX = Math.max(...all.map((rect) => rect.x + rect.width));
+  const maxY = Math.max(...all.map((rect) => rect.y + rect.height));
+  const px = (rect) => {
+    const x0 = Math.round((rect.x - minX) * scale);
+    const y0 = Math.round((rect.y - minY) * scale);
+    return { x: x0, y: y0, width: Math.max(1, Math.round((rect.x + rect.width - minX) * scale) - x0), height: Math.max(1, Math.round((rect.y + rect.height - minY) * scale) - y0) };
+  };
+  const screenPx = { x: Math.round((screenAt.x - minX) * scale), y: Math.round((screenAt.y - minY) * scale), width: display.width, height: display.height };
+  return {
+    layout: {
+      id,
+      width: Math.ceil((maxX - minX) * scale),
+      height: Math.ceil((maxY - minY) * scale),
+      screen: screenPx,
+      buttons: buttons.map(({ rect, ...button }) => ({ ...button, ...px(rect) }))
+    },
+    pieces: [...under, ...bodyPieces, ...over].map((piece) => ({ ...piece, rect: px(piece.rect) }))
+  };
+};
+var rasterize = async (pdf, key, width, height) => {
+  const stat = statSync(pdf);
+  const file = join2(CACHE, `${key.replace(/[^A-Za-z0-9_-]/g, "_")}-${width}x${height}-${Math.round(stat.mtimeMs)}.png`);
+  if (existsSync(file))
+    return readFile2(file);
+  await mkdir(CACHE, { recursive: true });
+  const temp = `${file}.${process.pid}.tmp.png`;
+  const result = await run(SIPS, ["-s", "format", "png", "-z", String(height), String(width), pdf, "--out", temp], { timeout: 15000 });
+  if (!result.ok)
+    throw new Error(result.stderr.trim() || `sips could not rasterize ${pdf}`);
+  await rename(temp, file);
+  return readFile2(file);
+};
+var deviceTypes = null;
+var loading = new Map;
+var build = async (deviceType) => {
+  deviceTypes ??= listDeviceTypes().catch((cause) => {
+    deviceTypes = null;
+    throw cause;
+  });
+  const bundle = (await deviceTypes).get(deviceType);
+  if (!bundle)
+    return null;
+  const resources = join2(bundle, "Contents", "Resources");
+  const display = parseDisplay(await readPlist(join2(resources, "capabilities.plist")));
+  if (!display)
+    return null;
+  const chromeDir = join2(CHROME_ROOT, `${display.chrome}.devicechrome`, "Contents", "Resources");
+  const spec = parseChromeJson(JSON.parse(await readFile2(join2(chromeDir, "chrome.json"), "utf8")));
+  if (!spec)
+    return null;
+  const pdfPath = (image) => join2(chromeDir, `${image}.pdf`);
+  const sizes = new Map;
+  const sizeOf = (image) => {
+    if (!sizes.has(image)) {
+      const file = pdfPath(image);
+      sizes.set(image, existsSync(file) ? pdfSize(readFileSync(file)) : null);
+    }
+    return sizes.get(image) ?? null;
+  };
+  const plan = planChrome(display.chrome, display, spec, sizeOf);
+  if (!plan)
+    return null;
+  const layer = { width: plan.layout.width, height: plan.layout.height, data: new Uint8Array(plan.layout.width * plan.layout.height * 4) };
+  for (const piece of plan.pieces) {
+    if ("fill" in piece) {
+      fillRect(layer, piece.rect, [0, 0, 0, 255]);
+      continue;
+    }
+    const png = await rasterize(pdfPath(piece.image), `${display.chrome}-${piece.image}`, piece.rect.width, piece.rect.height);
+    drawOver(layer, decodePng(png), piece.rect.x, piece.rect.y);
+  }
+  let mask = null;
+  let maskPng = null;
+  const maskPdf = display.mask ? join2(resources, `${display.mask}.pdf`) : null;
+  if (maskPdf && existsSync(maskPdf)) {
+    maskPng = await rasterize(maskPdf, `mask-${display.mask}`, display.width, display.height);
+    const decoded = decodePng(maskPng);
+    mask = new Uint8Array(decoded.width * decoded.height);
+    for (let index = 0;index < mask.length; index += 1)
+      mask[index] = decoded.data[index * 4 + 3];
+  }
+  let png = null;
+  return { layout: plan.layout, layer, mask, maskPng, layerPng: () => png ??= encodePng(layer) };
+};
+var loadChrome = (deviceType) => {
+  let pending = loading.get(deviceType);
+  if (!pending) {
+    pending = build(deviceType).catch((cause) => {
+      console.error(`device frame for ${deviceType}: ${cause instanceof Error ? cause.message : String(cause)}`);
+      return null;
+    });
+    loading.set(deviceType, pending);
+  }
+  return pending;
+};
 
 // src/service/rotate.ts
+import { mkdtemp, readFile as readFile3, rm as rm2, writeFile } from "node:fs/promises";
+import { tmpdir as tmpdir3 } from "node:os";
+import { join as join3 } from "node:path";
 var rotationFor = (orientation) => {
   switch (orientation) {
     case "landscape_left":
@@ -421,21 +946,21 @@ var deltaToPortrait = (du, dv, degrees) => {
       return { dx: du, dy: dv };
   }
 };
-var SIPS = ["/usr/bin/sips", "sips"];
+var SIPS2 = ["/usr/bin/sips", "sips"];
 var rotateJpeg = async (jpeg, degrees) => {
   if (degrees === 0)
     return jpeg;
-  const dir = await mkdtemp(join(tmpdir(), "oc-ios-sim-rot-"));
+  const dir = await mkdtemp(join3(tmpdir3(), "oc-ios-sim-rot-"));
   try {
-    const input = join(dir, "in.jpg");
-    const output = join(dir, "out.jpg");
+    const input = join3(dir, "in.jpg");
+    const output = join3(dir, "out.jpg");
     await writeFile(input, jpeg);
-    const result = await run(SIPS, ["-r", String(degrees), input, "--out", output], { timeout: 5000 });
+    const result = await run(SIPS2, ["-r", String(degrees), input, "--out", output], { timeout: 5000 });
     if (!result.ok)
       throw new Error(result.stderr.trim() || "sips failed");
-    return await readFile(output);
+    return await readFile3(output);
   } finally {
-    await rm(dir, { recursive: true, force: true });
+    await rm2(dir, { recursive: true, force: true });
   }
 };
 
@@ -445,16 +970,40 @@ var keyMessages = (events) => events.map((event) => ({ op: "key", event }));
 var translateInput = (events, frame, state, options = {}) => {
   const degrees = options.degrees ?? 0;
   const layout = options.layout ?? "us";
+  const chrome = options.chrome ?? null;
   const messages = [];
+  const buttons = [];
   let skippedChars = 0;
+  const portraitOf = (x, y) => toPortrait(clamp01(x / Math.max(1, frame.width)), clamp01(y / Math.max(1, frame.height)), degrees);
+  const onScreen = (portrait) => chrome ? {
+    x: (portrait.x * chrome.width - chrome.screen.x) / chrome.screen.width,
+    y: (portrait.y * chrome.height - chrome.screen.y) / chrome.screen.height
+  } : portrait;
   const point = (x, y) => {
-    const portrait = toPortrait(clamp01(x / Math.max(1, frame.width)), clamp01(y / Math.max(1, frame.height)), degrees);
-    return { x: clamp01(portrait.x), y: clamp01(portrait.y) };
+    const screen = onScreen(portraitOf(x, y));
+    return { x: clamp01(screen.x), y: clamp01(screen.y) };
+  };
+  const onFrame = (x, y) => {
+    if (!chrome)
+      return null;
+    const portrait = portraitOf(x, y);
+    const screen = onScreen(portrait);
+    if (screen.x >= 0 && screen.x <= 1 && screen.y >= 0 && screen.y <= 1)
+      return null;
+    const px = portrait.x * chrome.width;
+    const py = portrait.y * chrome.height;
+    return chrome.buttons.find((button) => px >= button.x && px <= button.x + button.width && py >= button.y && py <= button.y + button.height) ?? "bezel";
   };
   for (const event of events) {
     switch (event.type) {
       case "pointer": {
         if (event.action === "down" && event.button === 0) {
+          const hit = onFrame(event.x, event.y);
+          if (hit) {
+            if (hit !== "bezel")
+              buttons.push(hit);
+            break;
+          }
           state.touching = true;
           messages.push({ op: "touch", type: "begin", ...point(event.x, event.y) });
         } else if (event.action === "move" && state.touching && (event.buttons & 1) === 1) {
@@ -467,7 +1016,9 @@ var translateInput = (events, frame, state, options = {}) => {
         break;
       }
       case "wheel": {
-        const { dx, dy } = deltaToPortrait(event.deltaX / Math.max(1, frame.width), event.deltaY / Math.max(1, frame.height), degrees);
+        const delta = deltaToPortrait(event.deltaX / Math.max(1, frame.width), event.deltaY / Math.max(1, frame.height), degrees);
+        const dx = chrome ? delta.dx * chrome.width / chrome.screen.width : delta.dx;
+        const dy = chrome ? delta.dy * chrome.height / chrome.screen.height : delta.dy;
         if (dx !== 0 || dy !== 0)
           messages.push({ op: "scroll", dx, dy, ...point(event.x, event.y) });
         break;
@@ -504,7 +1055,7 @@ var translateInput = (events, frame, state, options = {}) => {
       }
     }
   }
-  return { messages, skippedChars };
+  return { messages, skippedChars, buttons };
 };
 var OPCODE = {
   touch: 3,
@@ -531,83 +1082,10 @@ var encodeMessage = (message) => {
   }
 };
 
-// src/service/simctl.ts
-import { readFile as readFile2, rm as rm2 } from "node:fs/promises";
-import { tmpdir as tmpdir2 } from "node:os";
-import { join as join2 } from "node:path";
-var runtimeLabel = (key) => {
-  const tail = key.split(".").pop() ?? key;
-  const match = /^([A-Za-z]+)-(\d+)-(\d+)$/.exec(tail);
-  return match ? `${match[1]} ${match[2]}.${match[3]}` : tail;
-};
-var runtimeVersion = (key) => (/iOS-(\d+)-(\d+)/.exec(key) ?? []).slice(1).map(Number);
-var parseDevices = (json) => {
-  const parsed = JSON.parse(json);
-  const runtimes = Object.keys(parsed.devices ?? {}).filter((key) => /SimRuntime\.iOS-/.test(key)).sort((a, b) => {
-    const [aMajor = 0, aMinor = 0] = runtimeVersion(a);
-    const [bMajor = 0, bMinor = 0] = runtimeVersion(b);
-    return bMajor - aMajor || bMinor - aMinor;
-  });
-  const devices = [];
-  for (const runtime of runtimes) {
-    for (const device of parsed.devices?.[runtime] ?? []) {
-      if (!device.udid || !device.name || device.isAvailable === false)
-        continue;
-      if (!/^(iPhone|iPad)\b/.test(device.name))
-        continue;
-      devices.push({ udid: device.udid, name: device.name, runtime: runtimeLabel(runtime), state: device.state ?? "Shutdown" });
-    }
-  }
-  return devices;
-};
-var defaultDevice = (devices) => devices.find((device) => /^iPhone \d/.test(device.name)) ?? devices.find((device) => device.name.startsWith("iPhone")) ?? devices[0] ?? null;
-var listDevices = async () => {
-  const result = await run(XCRUN, ["simctl", "list", "devices", "-j"]);
-  if (!result.ok)
-    throw new Error(`simctl list: ${result.stderr || "xcrun not found"}`);
-  return parseDevices(result.stdout);
-};
-var bootDevice = async (udid) => {
-  const boot = await run(XCRUN, ["simctl", "boot", udid], { timeout: 120000 });
-  if (!boot.ok && !/current state: Booted/i.test(boot.stderr))
-    throw new Error(boot.stderr.trim() || "Boot failed");
-  await run(XCRUN, ["simctl", "bootstatus", udid], { timeout: 180000 });
-};
-var shutdownDevice = async (udid) => {
-  const result = await run(XCRUN, ["simctl", "shutdown", udid], { timeout: 60000 });
-  if (!result.ok && !/current state: Shutdown/i.test(result.stderr))
-    throw new Error(result.stderr.trim() || "Shutdown failed");
-};
-var readAppearance = async (udid) => {
-  const result = await run(XCRUN, ["simctl", "ui", udid, "appearance"], { timeout: 5000 });
-  if (!result.ok)
-    return "unknown";
-  const value = result.stdout.trim();
-  return value === "light" || value === "dark" ? value : "unknown";
-};
-var setAppearance = async (udid, appearance) => {
-  const result = await run(XCRUN, ["simctl", "ui", udid, "appearance", appearance], { timeout: 1e4 });
-  if (!result.ok)
-    throw new Error(result.stderr.trim() || "Could not set the appearance");
-};
-var readKeyboardLayout = async (udid) => {
-  const result = await run(XCRUN, ["simctl", "spawn", udid, "defaults", "read", "-g", "AppleKeyboards"], { timeout: 1e4 });
-  return result.ok ? layoutFromKeyboards(result.stdout) : "us";
-};
-var screenshot = async (udid) => {
-  const file = join2(tmpdir2(), `oc-ios-sim-${process.pid}-${Date.now()}.png`);
-  try {
-    const result = await run(XCRUN, ["simctl", "io", udid, "screenshot", "--type=png", file], { timeout: 20000 });
-    if (!result.ok)
-      throw new Error(result.stderr.trim() || "Screenshot failed");
-    return await readFile2(file);
-  } finally {
-    await rm2(file, { force: true });
-  }
-};
-
-// src/service/simulator.ts
-import http from "node:http";
+// src/service/present.ts
+import { dirname as dirname2, join as join4 } from "node:path";
+import { fileURLToPath } from "node:url";
+import { Worker } from "node:worker_threads";
 
 // src/service/frames.ts
 var SEGMENT_HISTORY = 32;
@@ -679,12 +1157,169 @@ var createFrameHub = () => {
   };
 };
 
+// src/service/present.ts
+var WORKERS = 2;
+var QUALITY = 82;
+var VIEWER_GRACE_MS = 35000;
+var PULL_WAIT_MS = 1000;
+var VIEWS_MAX = 256;
+var sameView = (a, b) => a.degrees === b.degrees && (a.chrome?.id ?? null) === (b.chrome?.id ?? null);
+var createPool = () => {
+  const entry = join4(dirname2(fileURLToPath(import.meta.url)), "compose-worker.js");
+  const workers = [];
+  const jobs = new Map;
+  let nextId = 1;
+  const spawn = () => {
+    const worker = new Worker(entry);
+    const slot = { worker, busy: 0, layers: new Set };
+    worker.on("message", (answer) => {
+      slot.busy -= 1;
+      jobs.get(answer.id)?.resolve(answer);
+      jobs.delete(answer.id);
+    });
+    worker.on("error", (cause) => console.error(`compose worker: ${cause instanceof Error ? cause.message : String(cause)}`));
+    worker.on("exit", () => {
+      workers.splice(workers.indexOf(slot), 1);
+      for (const [id, job] of [...jobs]) {
+        if (job.worker !== worker)
+          continue;
+        jobs.delete(id);
+        job.resolve({ id, ok: false, error: "worker stopped" });
+      }
+    });
+    worker.unref();
+    workers.push(slot);
+    return slot;
+  };
+  return {
+    compose(key, layer, jpeg, degrees) {
+      const slot = workers.length < WORKERS ? spawn() : workers.reduce((a, b) => b.busy < a.busy ? b : a);
+      if (!slot.layers.has(key)) {
+        slot.worker.postMessage({ type: "layer", key, ...layer() });
+        slot.layers.add(key);
+      }
+      const id = nextId++;
+      slot.busy += 1;
+      return new Promise((resolve) => {
+        jobs.set(id, { worker: slot.worker, resolve });
+        const message = { type: "compose", id, key, jpeg: new Uint8Array(jpeg), degrees, quality: QUALITY };
+        slot.worker.postMessage(message);
+      });
+    },
+    stop() {
+      for (const { worker } of [...workers])
+        worker.terminate();
+    }
+  };
+};
+var createPresenter = (deps) => {
+  const shown = createFrameHub();
+  const views = new Map;
+  const pool = createPool();
+  const flattened = new Map;
+  let lastAsk = 0;
+  let running = false;
+  let submitted = 0;
+  let published = 0;
+  let inFlight = 0;
+  let freed = null;
+  const layerFor = (chrome, background) => {
+    const key = `${chrome.layout.id}:${background.join(",")}`;
+    return {
+      key,
+      build: () => {
+        let layer = flattened.get(key);
+        if (!layer) {
+          layer = { base: flatten(chrome.layer, background), screen: chrome.layout.screen, mask: chrome.mask };
+          flattened.set(key, layer);
+          if (flattened.size > 4)
+            flattened.delete(flattened.keys().next().value);
+        }
+        return layer;
+      }
+    };
+  };
+  const present = async (raw) => {
+    const plain = { data: raw.data, mime: raw.mime, width: raw.width, height: raw.height, title: raw.title };
+    if (raw.mime !== "image/jpeg")
+      return { frame: plain, view: { degrees: 0, chrome: null } };
+    const degrees = rotationFor(deps.orientation());
+    const chrome = deps.framed() ? deps.chrome() : null;
+    if (chrome && chrome.layout.screen.width === raw.width && chrome.layout.screen.height === raw.height) {
+      const { key, build } = layerFor(chrome, deps.background());
+      const answer = await pool.compose(key, build, raw.data, degrees);
+      if (answer.ok) {
+        return {
+          frame: { data: Buffer.from(answer.jpeg.buffer, answer.jpeg.byteOffset, answer.jpeg.byteLength), mime: "image/jpeg", width: answer.width, height: answer.height, title: raw.title },
+          view: { degrees, chrome: chrome.layout }
+        };
+      }
+      console.error(`device frame: ${answer.error}`);
+    }
+    if (degrees === 0)
+      return { frame: plain, view: { degrees, chrome: null } };
+    return { frame: { ...plain, data: await rotateJpeg(raw.data, degrees), ...rotatedSize(raw, degrees) }, view: { degrees, chrome: null } };
+  };
+  const submit = (raw) => {
+    submitted = raw.seq;
+    inFlight += 1;
+    present(raw).then(({ frame, view }) => {
+      if (raw.seq <= published)
+        return;
+      published = raw.seq;
+      const out = shown.publish(frame);
+      views.set(out.seq, view);
+      if (views.size > VIEWS_MAX)
+        views.delete(views.keys().next().value);
+    }).catch((cause) => console.error(`present: ${cause instanceof Error ? cause.message : String(cause)}`)).finally(() => {
+      inFlight -= 1;
+      freed?.();
+    });
+  };
+  const loop = async () => {
+    if (running)
+      return;
+    running = true;
+    try {
+      while (Date.now() - lastAsk < VIEWER_GRACE_MS) {
+        const raw = await deps.pull(submitted, PULL_WAIT_MS);
+        if (!raw)
+          continue;
+        while (inFlight >= WORKERS)
+          await new Promise((resolve) => freed = resolve);
+        const newest = deps.raw.current();
+        if (newest && newest.seq > submitted)
+          submit(newest);
+      }
+    } finally {
+      running = false;
+    }
+  };
+  return {
+    shown,
+    next(after, waitMs, signal) {
+      lastAsk = Date.now();
+      loop();
+      return shown.next(after, waitMs, signal);
+    },
+    viewOf: (seq) => views.get(seq),
+    currentView() {
+      const current = shown.current();
+      return (current && views.get(current.seq)) ?? { degrees: 0, chrome: null };
+    },
+    stop: () => pool.stop()
+  };
+};
+
+// src/service/simulator.ts
+import http from "node:http";
+
 // src/service/helper.ts
 import { spawn } from "node:child_process";
-import { existsSync, openSync, closeSync, readdirSync, readFileSync } from "node:fs";
+import { existsSync as existsSync2, openSync, closeSync, readdirSync, readFileSync as readFileSync2 } from "node:fs";
 import { createServer } from "node:net";
-import { tmpdir as tmpdir3 } from "node:os";
-import { join as join3 } from "node:path";
+import { tmpdir as tmpdir4 } from "node:os";
+import { join as join5 } from "node:path";
 var LOOPBACK = "127.0.0.1";
 var FIRST_PORT = 3100;
 var PORT_SPAN = 10;
@@ -696,7 +1331,7 @@ var isLoopbackUrl = (url) => {
     return false;
   }
 };
-var portsFromStateFiles = (dir = join3(tmpdir3(), "serve-sim")) => {
+var portsFromStateFiles = (dir = join5(tmpdir4(), "serve-sim")) => {
   const ports = [];
   let names = [];
   try {
@@ -706,7 +1341,7 @@ var portsFromStateFiles = (dir = join3(tmpdir3(), "serve-sim")) => {
   }
   for (const name of names) {
     try {
-      const state = JSON.parse(readFileSync(join3(dir, name), "utf8"));
+      const state = JSON.parse(readFileSync2(join5(dir, name), "utf8"));
       if (typeof state.url === "string" && isLoopbackUrl(state.url) && typeof state.port === "number")
         ports.push(state.port);
     } catch {}
@@ -730,7 +1365,7 @@ var portFree = (port) => new Promise((resolve) => {
   server.once("error", () => resolve(false));
   server.listen(port, LOOPBACK, () => server.close(() => resolve(true)));
 });
-var serveSimBinary = () => SERVE_SIM.find((candidate) => !candidate.startsWith("/") || existsSync(candidate)) ?? "serve-sim";
+var serveSimBinary = () => SERVE_SIM.find((candidate) => !candidate.startsWith("/") || existsSync2(candidate)) ?? "serve-sim";
 var sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 var starting = null;
 var ensureHelper = async (udid, preferred) => {
@@ -762,7 +1397,7 @@ var startHelper = async (udid) => {
   }
   if (port === null)
     throw new Error(`No free port ${FIRST_PORT}-${FIRST_PORT + PORT_SPAN - 1} for serve-sim`);
-  const log = openSync(join3(tmpdir3(), `openchamber-ios-simulator-serve-sim.log`), "a");
+  const log = openSync(join5(tmpdir4(), `openchamber-ios-simulator-serve-sim.log`), "a");
   const child = spawn(serveSimBinary(), [udid, "--port", String(port), "--host", LOOPBACK, "--exit-on-simulator-shutdown"], { detached: true, stdio: ["ignore", log, log], env: childEnv() });
   closeSync(log);
   let exited = false;
@@ -860,8 +1495,8 @@ var jpegSize = (jpeg) => {
 };
 
 // src/service/placeholder.ts
-import { deflateSync } from "node:zlib";
-var CRC_TABLE = (() => {
+import { deflateSync as deflateSync2 } from "node:zlib";
+var CRC_TABLE2 = (() => {
   const table = new Uint32Array(256);
   for (let n = 0;n < 256; n += 1) {
     let c = n;
@@ -871,18 +1506,18 @@ var CRC_TABLE = (() => {
   }
   return table;
 })();
-var crc32 = (bytes) => {
+var crc322 = (bytes) => {
   let crc = 4294967295;
   for (const byte of bytes)
-    crc = CRC_TABLE[(crc ^ byte) & 255] ^ crc >>> 8;
+    crc = CRC_TABLE2[(crc ^ byte) & 255] ^ crc >>> 8;
   return (crc ^ 4294967295) >>> 0;
 };
-var chunk = (type, data) => {
+var chunk2 = (type, data) => {
   const length = Buffer.alloc(4);
   length.writeUInt32BE(data.length);
   const body = Buffer.concat([Buffer.from(type, "latin1"), data]);
   const crc = Buffer.alloc(4);
-  crc.writeUInt32BE(crc32(body));
+  crc.writeUInt32BE(crc322(body));
   return Buffer.concat([length, body, crc]);
 };
 var solidPng = (width, height, rgb) => {
@@ -900,14 +1535,14 @@ var solidPng = (width, height, rgb) => {
   const raw = Buffer.concat(Array.from({ length: height }, () => row));
   return Buffer.concat([
     Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]),
-    chunk("IHDR", header),
-    chunk("IDAT", deflateSync(raw)),
-    chunk("IEND", Buffer.alloc(0))
+    chunk2("IHDR", header),
+    chunk2("IDAT", deflateSync2(raw)),
+    chunk2("IEND", Buffer.alloc(0))
   ]);
 };
 
 // src/service/simulator.ts
-var VIEWER_GRACE_MS = 35000;
+var VIEWER_GRACE_MS2 = 35000;
 var DEVICE_POLL_MS = 2000;
 var RECONNECT_MS = 1500;
 var APPEARANCE_TTL_MS = 15000;
@@ -930,6 +1565,7 @@ var createSimulator = () => {
   let orientation = null;
   let helperPort = null;
   let lastViewerAt = 0;
+  let framed = true;
   let streamUdid = null;
   let streamRequest = null;
   let streamConnected = false;
@@ -951,7 +1587,7 @@ var createSimulator = () => {
     }
     return devices;
   };
-  const viewerPresent = () => Date.now() - lastViewerAt < VIEWER_GRACE_MS;
+  const viewerPresent = () => Date.now() - lastViewerAt < VIEWER_GRACE_MS2;
   const showPlaceholder = () => {
     if (placeholderShown)
       return;
@@ -1125,6 +1761,13 @@ var createSimulator = () => {
     const socket = await openHid(device.udid);
     socket.send(encodeHid(opcode, payload));
   };
+  const switchStream = async () => {
+    await refreshDevices(true);
+    const device = activeDevice();
+    if (!device || device.udid === streamUdid || !viewerPresent())
+      return;
+    await startStream(device);
+  };
   const runBusy = async (kind, work) => {
     if (busy)
       throw new Error("Another boot or shutdown is in progress");
@@ -1165,40 +1808,48 @@ var createSimulator = () => {
         orientation: active ? orientation : null,
         appearance: active && appearance?.udid === active.udid ? appearance.value : "unknown",
         keyboard: active ? layouts.get(active.udid) ?? null : null,
+        framed,
         error
       };
     },
     async boot(udid) {
       await refreshDevices(true);
-      if (!devices.some((device) => device.udid === udid))
+      const device = devices.find((candidate) => candidate.udid === udid);
+      if (!device)
         throw new Error("Unknown device");
       selected = udid;
-      await runBusy("booting", async () => {
-        for (const device of devices) {
-          if (device.udid !== udid && device.state !== "Shutdown")
-            await shutdownDevice(device.udid);
-        }
-        stopStream();
-        closeHid();
-        await bootDevice(udid);
-      });
+      if (device.state !== "Booted")
+        await runBusy("booting", () => bootDevice(udid));
+      await switchStream();
     },
     async shutdown() {
       await refreshDevices(true);
+      const device = activeDevice();
+      if (!device)
+        return;
       await runBusy("shutting-down", async () => {
         stopStream();
         closeHid();
-        for (const device of devices) {
-          if (device.state !== "Shutdown")
-            await shutdownDevice(device.udid);
-        }
+        await shutdownDevice(device.udid);
       });
     },
     async select(udid) {
       await refreshDevices();
-      if (devices.some((device) => device.udid === udid) && !activeDevice())
-        selected = udid;
+      if (!devices.some((device) => device.udid === udid))
+        return;
+      selected = udid;
+      await switchStream();
     },
+    repaint() {
+      const shown = hub.current();
+      if (shown)
+        hub.publish({ data: shown.data, mime: shown.mime, width: shown.width, height: shown.height, title: shown.title });
+    },
+    framed: () => framed,
+    setFramed(on) {
+      framed = on;
+    },
+    active: () => activeDevice(),
     async button(name) {
       await sendRaw(OPCODE.button, name === "home" ? { button: "home" } : { button: "power", page: 12, usage: 48 });
     },
@@ -1209,6 +1860,12 @@ var createSimulator = () => {
       const shown = hub.current();
       if (shown)
         hub.publish({ data: shown.data, mime: shown.mime, width: shown.width, height: shown.height, title: shown.title });
+    },
+    async pressButton(name, page, usage) {
+      if (name === "home")
+        await sendRaw(OPCODE.button, { button: "home" });
+      else
+        await sendRaw(OPCODE.button, { button: name, page, usage });
     },
     async setAppearance(mode) {
       const device = await requireActive();
@@ -1259,25 +1916,43 @@ if (!port || !token) {
 }
 var BODY_MAX = 1024 * 1024;
 var ORIENTATIONS = ["portrait", "portrait_upside_down", "landscape_left", "landscape_right"];
+var PAGE_WAIT_MS = 1e4;
+var DEFAULT_BACKGROUND = [29, 27, 27];
 var sim = createSimulator();
-var inputState = { touching: false };
-var delivered = new Map;
-var DELIVERED_MAX = 256;
-var rotated = null;
-var remember = (seq, degrees) => {
-  delivered.set(seq, degrees);
-  if (delivered.size > DELIVERED_MAX)
-    delivered.delete(delivered.keys().next().value);
+var surfaceInput = { touching: false };
+var pageInput = { touching: false };
+var background = DEFAULT_BACKGROUND;
+var blobs = new Map;
+var BLOBS_MAX = 8;
+var putBlob = (id, base64) => {
+  blobs.delete(id);
+  blobs.set(id, base64);
+  if (blobs.size > BLOBS_MAX)
+    blobs.delete(blobs.keys().next().value);
+  return { id, length: base64.length };
 };
-var presentable = async (frame) => {
-  const degrees = frame.mime === "image/jpeg" ? rotationFor(sim.orientation()) : 0;
-  if (degrees === 0)
-    return { data: frame.data, width: frame.width, height: frame.height, degrees };
-  if (!rotated || rotated.seq !== frame.seq || rotated.degrees !== degrees) {
-    rotated = { seq: frame.seq, degrees, data: await rotateJpeg(frame.data, degrees) };
-  }
-  return { data: rotated.data, ...rotatedSize(frame, degrees), degrees };
+var chromes = new Map;
+var chromeForActive = () => {
+  const type = sim.active()?.deviceType;
+  if (!type)
+    return null;
+  if (chromes.has(type))
+    return chromes.get(type) ?? null;
+  loadChrome(type).then((chrome) => {
+    chromes.set(type, chrome);
+    if (chrome && sim.framed())
+      sim.repaint();
+  });
+  return null;
 };
+var presenter = createPresenter({
+  raw: sim.hub,
+  pull: (after, waitMs) => sim.nextFrame(after, waitMs),
+  orientation: () => sim.orientation(),
+  framed: () => sim.framed(),
+  chrome: chromeForActive,
+  background: () => background
+});
 var send = (res, status, body) => {
   res.writeHead(status, { "Content-Type": "application/json", "Cache-Control": "no-store" });
   res.end(JSON.stringify(body));
@@ -1309,6 +1984,51 @@ var handleFrame = async (_req, res, url) => {
   const wait = Math.min(Number(url.searchParams.get("wait") ?? "0") || 0, SURFACE_FRAME_WAIT_MS);
   const abort = new AbortController;
   res.on("close", () => abort.abort());
+  const frame = await presenter.next(after, wait, abort.signal);
+  if (res.destroyed)
+    return;
+  if (!frame) {
+    res.writeHead(204, { "Cache-Control": "no-store" });
+    res.end();
+    return;
+  }
+  res.writeHead(200, {
+    "Content-Type": frame.mime,
+    "Content-Length": String(frame.data.length),
+    "Cache-Control": "no-store",
+    [SURFACE_SEQ_HEADER]: String(frame.seq),
+    [SURFACE_WIDTH_HEADER]: String(frame.width),
+    [SURFACE_HEIGHT_HEADER]: String(frame.height),
+    [SURFACE_TITLE_HEADER]: frame.title.replace(/[^\x20-\x7e]/g, "").slice(0, 200)
+  });
+  res.end(frame.data);
+};
+var handleInput = async (req, res) => {
+  const batch = readSurfaceInputBatch(await readBody(req));
+  if (!batch)
+    return send(res, 400, { error: "bad input batch" });
+  const frameSeq = Number(req.headers[SURFACE_FRAME_SEQ_HEADER] ?? "0") || 0;
+  const shown = presenter.shown.current();
+  const view = presenter.currentView();
+  if (batch.events.some((event) => event.type === "pointer" || event.type === "wheel")) {
+    const seen = presenter.viewOf(frameSeq);
+    if (presenter.shown.isStale(frameSeq) || seen !== undefined && !sameView(seen, view))
+      return send(res, 409, { error: "stale frame" });
+  }
+  if (!shown || sim.hub.current()?.mime !== "image/jpeg")
+    return send(res, 409, { error: "no simulator picture" });
+  const layout = await sim.layout();
+  const { messages, skippedChars, buttons } = translateInput(batch.events, shown, surfaceInput, { degrees: view.degrees, layout, chrome: view.chrome });
+  await sim.sendHid(messages);
+  for (const button of buttons)
+    await sim.pressButton(button.name, button.page, button.usage);
+  send(res, 200, { ok: true, skippedChars });
+};
+var handlePageFrame = async (_req, res, url) => {
+  const after = Number(url.searchParams.get("after") ?? "0") || 0;
+  const wait = Math.min(Number(url.searchParams.get("wait") ?? "0") || 0, PAGE_WAIT_MS);
+  const abort = new AbortController;
+  res.on("close", () => abort.abort());
   const frame = await sim.nextFrame(after, wait, abort.signal);
   if (res.destroyed)
     return;
@@ -1317,39 +2037,53 @@ var handleFrame = async (_req, res, url) => {
     res.end();
     return;
   }
-  const shown = await presentable(frame);
-  if (res.destroyed)
-    return;
-  remember(frame.seq, shown.degrees);
-  res.writeHead(200, {
-    "Content-Type": frame.mime,
-    "Content-Length": String(shown.data.length),
-    "Cache-Control": "no-store",
-    [SURFACE_SEQ_HEADER]: String(frame.seq),
-    [SURFACE_WIDTH_HEADER]: String(shown.width),
-    [SURFACE_HEIGHT_HEADER]: String(shown.height),
-    [SURFACE_TITLE_HEADER]: frame.title.replace(/[^\x20-\x7e]/g, "").slice(0, 200)
-  });
-  res.end(shown.data);
+  const answer = {
+    seq: frame.seq,
+    mime: frame.mime,
+    width: frame.width,
+    height: frame.height,
+    degrees: frame.mime === "image/jpeg" ? rotationFor(sim.orientation()) : 0,
+    data: putBlob(`frame-${frame.seq}`, frame.data.toString("base64"))
+  };
+  send(res, 200, answer);
 };
-var handleInput = async (req, res) => {
-  const batch = readSurfaceInputBatch(await readBody(req));
-  if (!batch)
+var handlePageInput = async (req, res) => {
+  const body = await readBody(req);
+  const batch = readSurfaceInputBatch(body);
+  const { width, height } = JSON.parse(body);
+  if (!batch || typeof width !== "number" || typeof height !== "number" || width <= 0 || height <= 0) {
     return send(res, 400, { error: "bad input batch" });
-  const frameSeq = Number(req.headers[SURFACE_FRAME_SEQ_HEADER] ?? "0") || 0;
-  const current = sim.hub.current();
-  const degrees = rotationFor(sim.orientation());
-  if (batch.events.some((event) => event.type === "pointer" || event.type === "wheel")) {
-    const seen = delivered.get(frameSeq);
-    if (sim.hub.isStale(frameSeq) || seen !== undefined && seen !== degrees)
-      return send(res, 409, { error: "stale frame" });
   }
+  const current = sim.hub.current();
   if (!current || current.mime !== "image/jpeg")
     return send(res, 409, { error: "no simulator picture" });
+  if (current.width !== width || current.height !== height)
+    return send(res, 409, { error: "stale frame" });
   const layout = await sim.layout();
-  const { messages, skippedChars } = translateInput(batch.events, rotatedSize(current, degrees), inputState, { degrees, layout });
+  const { messages, skippedChars } = translateInput(batch.events, { width, height }, pageInput, { layout });
   await sim.sendHid(messages);
   send(res, 200, { ok: true, skippedChars });
+};
+var handleChrome = async (_req, res) => {
+  const type = sim.active()?.deviceType;
+  const chrome = type ? await loadChrome(type) : null;
+  if (type)
+    chromes.set(type, chrome);
+  const answer = chrome ? {
+    available: true,
+    layout: chrome.layout,
+    layer: putBlob(`chrome-${chrome.layout.id}-layer`, chrome.layerPng().toString("base64")),
+    mask: chrome.maskPng ? putBlob(`chrome-${chrome.layout.id}-mask`, chrome.maskPng.toString("base64")) : null
+  } : { available: false };
+  send(res, 200, answer);
+};
+var handleBlob = async (_req, res, url) => {
+  const blob = blobs.get(url.searchParams.get("id") ?? "");
+  const offset = Number(url.searchParams.get("offset") ?? "0") || 0;
+  if (blob === undefined)
+    return send(res, 404, { error: "gone" });
+  res.writeHead(200, { "Content-Type": "text/plain", "Cache-Control": "no-store" });
+  res.end(blob.slice(offset, offset + BLOB_CHUNK));
 };
 var routes = {
   "GET /surface/frame": handleFrame,
@@ -1360,7 +2094,7 @@ var routes = {
       return send(res, 400, { error: "bad control notice" });
     sim.setController(notice.controller);
     if (notice.controller !== "user")
-      inputState.touching = false;
+      surfaceInput.touching = false;
     send(res, 200, { ok: true });
   },
   "POST /surface/resize": async (_req, res) => send(res, 400, { error: "fixed size" }),
@@ -1383,9 +2117,34 @@ var routes = {
     await sim.shutdown();
     send(res, 200, await sim.state());
   },
+  "GET /page/frame": handlePageFrame,
+  "POST /page/input": handlePageInput,
+  "GET /chrome": handleChrome,
+  "GET /blob": handleBlob,
   "POST /button": async (req, res) => {
     const body = await readJson(req);
-    await sim.button(body.name === "lock" ? "lock" : "home");
+    const page = Number(body.page);
+    const usage = Number(body.usage);
+    if (typeof body.name === "string" && page > 0 && usage > 0)
+      await sim.pressButton(body.name, page, usage);
+    else
+      await sim.button(body.name === "lock" ? "lock" : "home");
+    send(res, 200, { ok: true });
+  },
+  "POST /frame": async (req, res) => {
+    const body = await readJson(req);
+    sim.setFramed(typeof body.on === "boolean" ? body.on : !sim.framed());
+    sim.repaint();
+    send(res, 200, await sim.state());
+  },
+  "POST /frame-style": async (req, res) => {
+    const body = await readJson(req);
+    const next = parseColor(body.background, DEFAULT_BACKGROUND);
+    if (next.join() !== background.join()) {
+      background = next;
+      if (sim.framed())
+        sim.repaint();
+    }
     send(res, 200, { ok: true });
   },
   "POST /rotate": async (req, res) => {
@@ -1445,6 +2204,7 @@ var server = http2.createServer((req, res) => {
 });
 var shutdown = () => {
   sim.stop();
+  presenter.stop();
   server.close();
   process.exit(0);
 };

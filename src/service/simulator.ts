@@ -1,6 +1,8 @@
-// Holds the state together: which device runs, the MJPEG connection to the
+// Holds the state together: which device is shown, the MJPEG connection to the
 // loopback helper, the HID WebSocket, and boot/shutdown in progress. Frames
-// are only pulled while someone watches (frame requests keep coming).
+// are only pulled while someone watches (frame requests keep coming). Several
+// simulators may run; the one shown is the chosen one if it runs, else any
+// running one. Nothing is shut down unless asked for.
 import http from 'node:http';
 
 import type { Appearance, Busy, Device, KeyboardLayout, Orientation, SimState } from '../shared/state.ts';
@@ -47,6 +49,7 @@ export const createSimulator = () => {
   let orientation: Orientation | null = null;
   let helperPort: number | null = null;
   let lastViewerAt = 0;
+  let framed = true;
 
   // Upstream MJPEG for exactly one device.
   let streamUdid: string | null = null;
@@ -247,6 +250,14 @@ export const createSimulator = () => {
     socket.send(encodeHid(opcode, payload));
   };
 
+  /** Moves the stream to the device now shown, right away instead of at the next device poll. */
+  const switchStream = async () => {
+    await refreshDevices(true);
+    const device = activeDevice();
+    if (!device || device.udid === streamUdid || !viewerPresent()) return;
+    await startStream(device);
+  };
+
   const runBusy = async (kind: Exclude<Busy, null>, work: () => Promise<void>) => {
     if (busy) throw new Error('Another boot or shutdown is in progress');
     busy = kind;
@@ -287,41 +298,55 @@ export const createSimulator = () => {
         orientation: active ? orientation : null,
         appearance: active && appearance?.udid === active.udid ? appearance.value : 'unknown',
         keyboard: active ? (layouts.get(active.udid) ?? null) : null,
+        framed,
         error,
       };
     },
 
-    /** Boots `udid` and shuts every other running device down first: one simulator at a time. */
+    /** Shows `udid`, booting it first when it is not running. Other running devices keep running. */
     async boot(udid: string) {
       await refreshDevices(true);
-      if (!devices.some((device) => device.udid === udid)) throw new Error('Unknown device');
+      const device = devices.find((candidate) => candidate.udid === udid);
+      if (!device) throw new Error('Unknown device');
       selected = udid;
-      await runBusy('booting', async () => {
-        for (const device of devices) {
-          if (device.udid !== udid && device.state !== 'Shutdown') await shutdownDevice(device.udid);
-        }
-        stopStream();
-        closeHid();
-        await bootDevice(udid);
-      });
+      if (device.state !== 'Booted') await runBusy('booting', () => bootDevice(udid));
+      await switchStream();
     },
 
+    /** Shuts down the device shown, nothing else. */
     async shutdown() {
       await refreshDevices(true);
+      const device = activeDevice();
+      if (!device) return;
       await runBusy('shutting-down', async () => {
         stopStream();
         closeHid();
-        for (const device of devices) {
-          if (device.state !== 'Shutdown') await shutdownDevice(device.udid);
-        }
+        await shutdownDevice(device.udid);
       });
     },
 
-    /** Remembers the toolbar's choice while nothing is booted. */
+    /** The toolbar's choice: shown at once when it runs, otherwise preselected for the power button. */
     async select(udid: string) {
       await refreshDevices();
-      if (devices.some((device) => device.udid === udid) && !activeDevice()) selected = udid;
+      if (!devices.some((device) => device.udid === udid)) return;
+      selected = udid;
+      await switchStream();
     },
+
+    /** Sends the newest picture again, so a changed view (frame, rotation) shows without waiting for the screen to change. */
+    repaint() {
+      const shown = hub.current();
+      if (shown) hub.publish({ data: shown.data, mime: shown.mime, width: shown.width, height: shown.height, title: shown.title });
+    },
+
+    framed: (): boolean => framed,
+
+    setFramed(on: boolean) {
+      framed = on;
+    },
+
+    /** The device shown, from the last device list (no refresh). */
+    active: (): Device | null => activeDevice(),
 
     async button(name: 'home' | 'lock') {
       await sendRaw(OPCODE.button, name === 'home' ? { button: 'home' } : { button: 'power', page: 12, usage: 48 });
@@ -334,6 +359,12 @@ export const createSimulator = () => {
       // A still screen may send no new frame; republish the current one so it shows rotated.
       const shown = hub.current();
       if (shown) hub.publish({ data: shown.data, mime: shown.mime, width: shown.width, height: shown.height, title: shown.title });
+    },
+
+    /** A hardware button from the device frame, by its HID usage (as in Xcode's chrome.json). */
+    async pressButton(name: string, page: number, usage: number) {
+      if (name === 'home') await sendRaw(OPCODE.button, { button: 'home' });
+      else await sendRaw(OPCODE.button, { button: name, page, usage });
     },
 
     async setAppearance(mode?: 'light' | 'dark') {

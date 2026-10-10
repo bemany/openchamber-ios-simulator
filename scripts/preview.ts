@@ -1,7 +1,7 @@
 // Preview without OpenChamber: a small stand-in host that loads the docked
 // toolbar and the status section in sandboxed iframes, draws the surface
 // picture, and sends pointer, wheel, keyboard and paste to the service the way
-// the real host does.
+// the real host does. `<prefix>/page` shows the full-screen page the same way.
 //
 //   bun run preview                         # http://127.0.0.1:4790/<random>/
 //   bun run preview -- 4790 <tailscale-ip>  # reachable from another device in your tailnet
@@ -28,6 +28,44 @@ const service = spawn(Bun.which('node') ?? process.execPath, [resolve(root, 'dis
 process.on('exit', () => service.kill());
 process.on('SIGINT', () => process.exit(0));
 
+const shim = `<script>
+const P = ${JSON.stringify(prefix)};
+const theme = { background:'#151313', elevated:'#1d1b1b', foreground:'#c9c5ba', muted:'#8a857c', subtle:'#2a2727', border:'#2f2c2c',
+  hover:'#262323', selection:'#3a3330', focus:'#d98a5a', primary:'#d98a5a', mutedSurface:'#1a1818', elevatedForeground:'#c9c5ba',
+  active:'#302c2c', selectionForeground:'#f0ece4', primaryForeground:'#1a1310', primaryText:'#e09a6e', successText:'#7fc28a',
+  warningText:'#e3b85c', errorText:'#e57a6e', infoText:'#7fb0e0', success:'#5fa86c', warning:'#d4a03c', error:'#d4604f', info:'#5a90c8',
+  font:'-apple-system, system-ui, sans-serif', mono:'ui-monospace, monospace', radius:'8px' };
+const envelope = { channel: 'openchamber.sdk', v: 1 };
+const frames = [...document.querySelectorAll('iframe')];
+const statusFrame = document.getElementById('status');
+const log = (text) => { const node = document.getElementById('log'); if (node) node.textContent = new Date().toLocaleTimeString() + '  ' + text; };
+addEventListener('message', async (event) => {
+  const message = event.data;
+  const frame = frames.find((candidate) => candidate.contentWindow === event.source);
+  if (!frame || !message || message.channel !== 'openchamber.sdk') return;
+  const reply = (body) => frame.contentWindow.postMessage({ ...envelope, type: 'result', id: message.id, ...body }, '*');
+  if (message.type === 'hello') {
+    frame.contentWindow.postMessage({ ...envelope, type: 'ready', payload: { theme: { mode: 'dark', tokens: theme }, locale: 'de',
+      directory: null, session: null, surface: frame.dataset.surface, connection: { connected: false, account: null }, settings: {}, item: null } }, '*');
+    return;
+  }
+  if (message.type === 'resize' && statusFrame && frame === statusFrame) statusFrame.style.height = Math.max(24, Math.min(200, message.payload.height)) + 'px';
+  if (!message.id) return;
+  if (message.type === 'service-request') {
+    const { method, path, body, query } = message.payload;
+    const search = query ? '?' + new URLSearchParams(query) : '';
+    const response = await fetch(P + '/service' + path + search, { method, body: method === 'GET' ? undefined : body, headers: { 'content-type': 'application/json' } });
+    // Like the host: answers are cut at GUEST_REQUEST_RESPONSE_MAX characters.
+    const text = (await response.text()).slice(0, 256000);
+    if (path !== '/blob' && path !== '/page/frame') log(method + ' ' + path + ' -> ' + response.status);
+    reply({ ok: true, payload: { status: response.status, body: text } });
+    return;
+  }
+  if (message.type === 'toast') log('Toast: ' + (message.payload && message.payload.message));
+  reply({ ok: true });
+});
+</script>`;
+
 const page = `<!doctype html>
 <html><head><meta charset="utf-8"><title>iOS Simulator preview</title>
 <style>
@@ -42,47 +80,13 @@ const page = `<!doctype html>
   #log{flex:none;font:11px ui-monospace,monospace;color:#8a857c;padding:4px 8px;border-top:1px solid #2f2c2c;white-space:nowrap;overflow:hidden}
 </style></head>
 <body><div id="wrap">
-  <iframe id="dock" sandbox="allow-scripts" src="${prefix}/dist/panel/index.html"></iframe>
+  <iframe id="dock" data-surface="panel" sandbox="allow-scripts" src="${prefix}/dist/panel/index.html"></iframe>
   <div id="stage" tabindex="0"><img id="frame" alt="Simulator"></div>
   <div id="log">-</div>
-  <div id="statusbox"><div class="title">iOS Simulator</div><iframe id="status" sandbox="allow-scripts" src="${prefix}/dist/status/index.html"></iframe></div>
+  <div id="statusbox"><div class="title">iOS Simulator &middot; <a href="${prefix}/page" target="_blank" style="color:inherit">Vollbild-Seite</a></div><iframe id="status" data-surface="status" sandbox="allow-scripts" src="${prefix}/dist/status/index.html"></iframe></div>
 </div>
+${shim}
 <script>
-const P = ${JSON.stringify(prefix)};
-const theme = { background:'#151313', elevated:'#1d1b1b', foreground:'#c9c5ba', muted:'#8a857c', subtle:'#2a2727', border:'#2f2c2c',
-  hover:'#262323', selection:'#3a3330', focus:'#d98a5a', primary:'#d98a5a', mutedSurface:'#1a1818', elevatedForeground:'#c9c5ba',
-  active:'#302c2c', selectionForeground:'#f0ece4', primaryForeground:'#1a1310', primaryText:'#e09a6e', successText:'#7fc28a',
-  warningText:'#e3b85c', errorText:'#e57a6e', infoText:'#7fb0e0', success:'#5fa86c', warning:'#d4a03c', error:'#d4604f', info:'#5a90c8',
-  font:'-apple-system, system-ui, sans-serif', mono:'ui-monospace, monospace', radius:'8px' };
-const envelope = { channel: 'openchamber.sdk', v: 1 };
-const dock = document.getElementById('dock');
-const statusFrame = document.getElementById('status');
-const frames = [dock, statusFrame];
-const log = (text) => { document.getElementById('log').textContent = new Date().toLocaleTimeString() + '  ' + text; };
-addEventListener('message', async (event) => {
-  const message = event.data;
-  const frame = frames.find((candidate) => candidate.contentWindow === event.source);
-  if (!frame || !message || message.channel !== 'openchamber.sdk') return;
-  const reply = (body) => frame.contentWindow.postMessage({ ...envelope, type: 'result', id: message.id, ...body }, '*');
-  if (message.type === 'hello') {
-    frame.contentWindow.postMessage({ ...envelope, type: 'ready', payload: { theme: { mode: 'dark', tokens: theme }, locale: 'de',
-      directory: null, session: null, surface: frame === dock ? 'panel' : 'status', connection: { connected: false, account: null }, settings: {}, item: null } }, '*');
-    return;
-  }
-  if (message.type === 'resize' && frame === statusFrame) statusFrame.style.height = Math.max(24, Math.min(200, message.payload.height)) + 'px';
-  if (!message.id) return;
-  if (message.type === 'service-request') {
-    const { method, path, body } = message.payload;
-    const response = await fetch(P + '/service' + path, { method, body: method === 'GET' ? undefined : body, headers: { 'content-type': 'application/json' } });
-    const text = await response.text();
-    log(method + ' ' + path + ' -> ' + response.status);
-    reply({ ok: true, payload: { status: response.status, body: text } });
-    return;
-  }
-  if (message.type === 'toast') log('Toast: ' + (message.payload && message.payload.message));
-  reply({ ok: true });
-});
-
 // Surface: fetch frames one at a time.
 const img = document.getElementById('frame');
 let seq = 0, drawn = 0, width = 1, height = 1;
@@ -127,6 +131,13 @@ stage.addEventListener('keyup', (e) => { e.preventDefault(); send({ type: 'key',
 stage.addEventListener('paste', (e) => { e.preventDefault(); send({ type: 'text', text: e.clipboardData.getData('text/plain') }); });
 </script></body></html>`;
 
+const fullPage = `<!doctype html>
+<html><head><meta charset="utf-8"><title>iOS Simulator page preview</title>
+<style>html,body{margin:0;height:100%;background:#151313}#page{display:block;border:0;width:100%;height:100%}</style></head>
+<body><iframe id="page" data-surface="page" sandbox="allow-scripts" src="${prefix}/dist/page/index.html"></iframe>
+${shim}
+</body></html>`;
+
 Bun.serve({
   port,
   hostname,
@@ -135,6 +146,7 @@ Bun.serve({
     if (!url.pathname.startsWith(`${prefix}/`)) return new Response('Not found', { status: 404 });
     const path = url.pathname.slice(prefix.length);
     if (path === '/') return new Response(page, { headers: { 'content-type': 'text/html' } });
+    if (path === '/page') return new Response(fullPage, { headers: { 'content-type': 'text/html' } });
     if (path.startsWith('/service/')) {
       const headers: Record<string, string> = { authorization: `Bearer ${token}`, 'content-type': 'application/json' };
       const seq = request.headers.get('x-surface-frame-seq');

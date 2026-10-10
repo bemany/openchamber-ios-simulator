@@ -33,6 +33,7 @@ const ICONS = {
   rotate: ['M20 12a8 8 0 1 1-2.4-5.7', 'M20 4v5h-5'],
   contrast: ['M12 4a8 8 0 1 0 0 16a8 8 0 1 0 0-16z', 'M12 4v16'],
   lock: ['M6 11h12v9H6z', 'M8.5 11V8a3.5 3.5 0 0 1 7 0v3'],
+  frame: ['M8 2.5h8a2.5 2.5 0 0 1 2.5 2.5v14a2.5 2.5 0 0 1-2.5 2.5H8A2.5 2.5 0 0 1 5.5 19V5A2.5 2.5 0 0 1 8 2.5z', 'M10.5 5.5h3'],
 } as const;
 
 export type IconName = keyof typeof ICONS;

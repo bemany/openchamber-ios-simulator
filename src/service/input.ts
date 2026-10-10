@@ -4,7 +4,7 @@
 // down", so it can be tested.
 import type { SurfaceInputEvent } from '@openchamber/sdk';
 
-import type { KeyboardLayout } from '../shared/state.ts';
+import type { ChromeButton, ChromeLayout, KeyboardLayout } from '../shared/state.ts';
 import { pressSequence, strokeForChar, typeText, usageForNamedKey, type HidKeyEvent } from './keymap.ts';
 import { deltaToPortrait, toPortrait } from './rotate.ts';
 
@@ -21,6 +21,8 @@ export type InputOptions = {
   /** Clockwise rotation the shown frame got from the portrait framebuffer (see rotate.ts). */
   degrees?: number;
   layout?: KeyboardLayout;
+  /** The device frame the picture was drawn in: input counts on its screen, and its buttons press. */
+  chrome?: ChromeLayout | null;
 };
 
 const clamp01 = (value: number): number => (value < 0 ? 0 : value > 1 ? 1 : value);
@@ -33,20 +35,48 @@ export const translateInput = (
   frame: FrameBox,
   state: InputState,
   options: InputOptions = {},
-): { messages: HidMessage[]; skippedChars: number } => {
+): { messages: HidMessage[]; skippedChars: number; buttons: ChromeButton[] } => {
   const degrees = options.degrees ?? 0;
   const layout = options.layout ?? 'us';
+  const chrome = options.chrome ?? null;
   const messages: HidMessage[] = [];
+  const buttons: ChromeButton[] = [];
   let skippedChars = 0;
+  /** Normalized in the portrait picture (the whole frame when there is one). */
+  const portraitOf = (x: number, y: number) =>
+    toPortrait(clamp01(x / Math.max(1, frame.width)), clamp01(y / Math.max(1, frame.height)), degrees);
+  /** Normalized on the simulator's screen. */
+  const onScreen = (portrait: { x: number; y: number }) =>
+    chrome
+      ? {
+          x: (portrait.x * chrome.width - chrome.screen.x) / chrome.screen.width,
+          y: (portrait.y * chrome.height - chrome.screen.y) / chrome.screen.height,
+        }
+      : portrait;
   const point = (x: number, y: number) => {
-    const portrait = toPortrait(clamp01(x / Math.max(1, frame.width)), clamp01(y / Math.max(1, frame.height)), degrees);
-    return { x: clamp01(portrait.x), y: clamp01(portrait.y) };
+    const screen = onScreen(portraitOf(x, y));
+    return { x: clamp01(screen.x), y: clamp01(screen.y) };
+  };
+  /** A press on the frame: a hardware button, or the bezel (nothing). `null` on the screen. */
+  const onFrame = (x: number, y: number): ChromeButton | 'bezel' | null => {
+    if (!chrome) return null;
+    const portrait = portraitOf(x, y);
+    const screen = onScreen(portrait);
+    if (screen.x >= 0 && screen.x <= 1 && screen.y >= 0 && screen.y <= 1) return null;
+    const px = portrait.x * chrome.width;
+    const py = portrait.y * chrome.height;
+    return chrome.buttons.find((button) => px >= button.x && px <= button.x + button.width && py >= button.y && py <= button.y + button.height) ?? 'bezel';
   };
 
   for (const event of events) {
     switch (event.type) {
       case 'pointer': {
         if (event.action === 'down' && event.button === 0) {
+          const hit = onFrame(event.x, event.y);
+          if (hit) {
+            if (hit !== 'bezel') buttons.push(hit);
+            break;
+          }
           state.touching = true;
           messages.push({ op: 'touch', type: 'begin', ...point(event.x, event.y) });
         } else if (event.action === 'move' && state.touching && (event.buttons & 1) === 1) {
@@ -60,7 +90,9 @@ export const translateInput = (
       }
       case 'wheel': {
         // serve-sim takes the scroll distance as a share of the screen size.
-        const { dx, dy } = deltaToPortrait(event.deltaX / Math.max(1, frame.width), event.deltaY / Math.max(1, frame.height), degrees);
+        const delta = deltaToPortrait(event.deltaX / Math.max(1, frame.width), event.deltaY / Math.max(1, frame.height), degrees);
+        const dx = chrome ? (delta.dx * chrome.width) / chrome.screen.width : delta.dx;
+        const dy = chrome ? (delta.dy * chrome.height) / chrome.screen.height : delta.dy;
         if (dx !== 0 || dy !== 0) messages.push({ op: 'scroll', dx, dy, ...point(event.x, event.y) });
         break;
       }
@@ -94,7 +126,7 @@ export const translateInput = (
       }
     }
   }
-  return { messages, skippedChars };
+  return { messages, skippedChars, buttons };
 };
 
 /** serve-sim's binary format: one opcode byte, then JSON. */
