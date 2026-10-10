@@ -17,4 +17,4 @@
 
 ## 4. Release
 
-- [ ] 4.1 Update README (features, limitations, troubleshooting), `bun run check` and `node scripts/smoke.mjs` green, `dist/` committed, issue #5 closed with the commit
+- [x] 4.1 Update README (features, limitations, troubleshooting), `bun run check` and `node scripts/smoke.mjs` green, `dist/` committed, issue #5 closed with the commit
