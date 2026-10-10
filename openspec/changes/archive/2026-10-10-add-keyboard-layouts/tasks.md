@@ -18,4 +18,4 @@
 
 ## 4. Release
 
-- [ ] 4.1 `bun run check` and `node scripts/smoke.mjs` green, `dist/` committed, issue #6 closed with the commit
+- [x] 4.1 `bun run check` and `node scripts/smoke.mjs` green, `dist/` committed, issue #6 closed with the commit
