@@ -212,6 +212,9 @@ var readSurfaceControlNotice = (body) => {
   return notice;
 };
 // src/shared/state.ts
+var QUALITIES = ["full", "balanced", "fast"];
+var QUALITY_DIVISOR = { full: 1, balanced: 2, fast: 3 };
+var DEFAULT_QUALITY = "balanced";
 var BLOB_CHUNK = 240000;
 
 // src/service/chrome.ts
@@ -280,6 +283,10 @@ var flatten = (layer, background) => {
   }
   return { width: layer.width, height: layer.height, data };
 };
+var shrunkSize = (width, height, divisor) => ({
+  width: Math.floor(width / divisor),
+  height: Math.floor(height / divisor)
+});
 
 // src/service/exec.ts
 import { execFile } from "node:child_process";
@@ -609,6 +616,12 @@ var parseDevices = (json) => {
   }
   return devices;
 };
+var shownDevice = (devices, selected) => {
+  if (selected && devices.some((device) => device.udid === selected)) {
+    return devices.find((device) => device.udid === selected && device.state === "Booted") ?? null;
+  }
+  return devices.find((device) => device.state === "Booted") ?? null;
+};
 var defaultDevice = (devices) => devices.find((device) => /^iPhone \d/.test(device.name)) ?? devices.find((device) => device.name.startsWith("iPhone")) ?? devices[0] ?? null;
 var listDevices = async () => {
   const result = await run(XCRUN, ["simctl", "list", "devices", "-j"]);
@@ -843,7 +856,7 @@ var rasterize = async (pdf, key, width, height) => {
 };
 var deviceTypes = null;
 var loading = new Map;
-var build = async (deviceType) => {
+var build = async (deviceType, divisor) => {
   deviceTypes ??= listDeviceTypes().catch((cause) => {
     deviceTypes = null;
     throw cause;
@@ -852,9 +865,10 @@ var build = async (deviceType) => {
   if (!bundle)
     return null;
   const resources = join2(bundle, "Contents", "Resources");
-  const display = parseDisplay(await readPlist(join2(resources, "capabilities.plist")));
-  if (!display)
+  const full = parseDisplay(await readPlist(join2(resources, "capabilities.plist")));
+  if (!full)
     return null;
+  const display = { ...full, ...shrunkSize(full.width, full.height, divisor), scale: full.scale / divisor };
   const chromeDir = join2(CHROME_ROOT, `${display.chrome}.devicechrome`, "Contents", "Resources");
   const spec = parseChromeJson(JSON.parse(await readFile2(join2(chromeDir, "chrome.json"), "utf8")));
   if (!spec)
@@ -868,7 +882,7 @@ var build = async (deviceType) => {
     }
     return sizes.get(image) ?? null;
   };
-  const plan = planChrome(display.chrome, display, spec, sizeOf);
+  const plan = planChrome(divisor > 1 ? `${display.chrome}@${divisor}` : display.chrome, display, spec, sizeOf);
   if (!plan)
     return null;
   const layer = { width: plan.layout.width, height: plan.layout.height, data: new Uint8Array(plan.layout.width * plan.layout.height * 4) };
@@ -893,14 +907,15 @@ var build = async (deviceType) => {
   let png = null;
   return { layout: plan.layout, layer, mask, maskPng, layerPng: () => png ??= encodePng(layer) };
 };
-var loadChrome = (deviceType) => {
-  let pending = loading.get(deviceType);
+var loadChrome = (deviceType, divisor = 1) => {
+  const key = `${deviceType}@${divisor}`;
+  let pending = loading.get(key);
   if (!pending) {
-    pending = build(deviceType).catch((cause) => {
+    pending = build(deviceType, divisor).catch((cause) => {
       console.error(`device frame for ${deviceType}: ${cause instanceof Error ? cause.message : String(cause)}`);
       return null;
     });
-    loading.set(deviceType, pending);
+    loading.set(key, pending);
   }
   return pending;
 };
@@ -1083,6 +1098,7 @@ var encodeMessage = (message) => {
 };
 
 // src/service/present.ts
+import { availableParallelism } from "node:os";
 import { dirname as dirname2, join as join4 } from "node:path";
 import { fileURLToPath } from "node:url";
 import { Worker } from "node:worker_threads";
@@ -1158,8 +1174,8 @@ var createFrameHub = () => {
 };
 
 // src/service/present.ts
-var WORKERS = 2;
-var QUALITY = 82;
+var WORKERS = Math.min(4, Math.max(2, Math.floor(availableParallelism() / 3)));
+var qualityFor = (divisor) => divisor > 1 ? 75 : 82;
 var VIEWER_GRACE_MS = 35000;
 var PULL_WAIT_MS = 1000;
 var VIEWS_MAX = 256;
@@ -1192,9 +1208,9 @@ var createPool = () => {
     return slot;
   };
   return {
-    compose(key, layer, jpeg, degrees) {
+    compose(key, layer, jpeg, divisor, degrees) {
       const slot = workers.length < WORKERS ? spawn() : workers.reduce((a, b) => b.busy < a.busy ? b : a);
-      if (!slot.layers.has(key)) {
+      if (key !== null && layer && !slot.layers.has(key)) {
         slot.worker.postMessage({ type: "layer", key, ...layer() });
         slot.layers.add(key);
       }
@@ -1202,7 +1218,7 @@ var createPool = () => {
       slot.busy += 1;
       return new Promise((resolve) => {
         jobs.set(id, { worker: slot.worker, resolve });
-        const message = { type: "compose", id, key, jpeg: new Uint8Array(jpeg), degrees, quality: QUALITY };
+        const message = { type: "compose", id, key, jpeg: new Uint8Array(jpeg), divisor, degrees, quality: qualityFor(divisor) };
         slot.worker.postMessage(message);
       });
     },
@@ -1239,26 +1255,51 @@ var createPresenter = (deps) => {
       }
     };
   };
+  const fromAnswer = (answer, title) => ({
+    data: Buffer.from(answer.jpeg.buffer, answer.jpeg.byteOffset, answer.jpeg.byteLength),
+    mime: "image/jpeg",
+    width: answer.width,
+    height: answer.height,
+    title
+  });
   const present = async (raw) => {
     const plain = { data: raw.data, mime: raw.mime, width: raw.width, height: raw.height, title: raw.title };
     if (raw.mime !== "image/jpeg")
       return { frame: plain, view: { degrees: 0, chrome: null } };
     const degrees = rotationFor(deps.orientation());
+    const divisor = deps.divisor();
+    const size = shrunkSize(raw.width, raw.height, divisor);
     const chrome = deps.framed() ? deps.chrome() : null;
-    if (chrome && chrome.layout.screen.width === raw.width && chrome.layout.screen.height === raw.height) {
+    if (chrome && chrome.layout.screen.width === size.width && chrome.layout.screen.height === size.height) {
       const { key, build } = layerFor(chrome, deps.background());
-      const answer = await pool.compose(key, build, raw.data, degrees);
-      if (answer.ok) {
-        return {
-          frame: { data: Buffer.from(answer.jpeg.buffer, answer.jpeg.byteOffset, answer.jpeg.byteLength), mime: "image/jpeg", width: answer.width, height: answer.height, title: raw.title },
-          view: { degrees, chrome: chrome.layout }
-        };
-      }
+      const answer = await pool.compose(key, build, raw.data, divisor, degrees);
+      if (answer.ok)
+        return { frame: fromAnswer(answer, raw.title), view: { degrees, chrome: chrome.layout } };
       console.error(`device frame: ${answer.error}`);
+    }
+    if (divisor > 1) {
+      const answer = await pool.compose(null, null, raw.data, divisor, degrees);
+      if (answer.ok)
+        return { frame: fromAnswer(answer, raw.title), view: { degrees, chrome: null } };
+      console.error(`shrink: ${answer.error}`);
     }
     if (degrees === 0)
       return { frame: plain, view: { degrees, chrome: null } };
     return { frame: { ...plain, data: await rotateJpeg(raw.data, degrees), ...rotatedSize(raw, degrees) }, view: { degrees, chrome: null } };
+  };
+  let pageCache = null;
+  const forPage = async (raw) => {
+    const divisor = deps.divisor();
+    const plain = { data: raw.data, mime: raw.mime, width: raw.width, height: raw.height, title: raw.title };
+    if (raw.mime !== "image/jpeg" || divisor <= 1)
+      return plain;
+    if (pageCache?.seq === raw.seq && pageCache.divisor === divisor)
+      return pageCache.frame;
+    const answer = await pool.compose(null, null, raw.data, divisor, 0);
+    if (!answer.ok)
+      return plain;
+    pageCache = { seq: raw.seq, divisor, frame: fromAnswer(answer, raw.title) };
+    return pageCache.frame;
   };
   const submit = (raw) => {
     submitted = raw.seq;
@@ -1303,6 +1344,7 @@ var createPresenter = (deps) => {
       return shown.next(after, waitMs, signal);
     },
     viewOf: (seq) => views.get(seq),
+    forPage,
     currentView() {
       const current = shown.current();
       return (current && views.get(current.seq)) ?? { degrees: 0, chrome: null };
@@ -1566,6 +1608,7 @@ var createSimulator = () => {
   let helperPort = null;
   let lastViewerAt = 0;
   let framed = true;
+  let quality = DEFAULT_QUALITY;
   let streamUdid = null;
   let streamRequest = null;
   let streamConnected = false;
@@ -1575,7 +1618,7 @@ var createSimulator = () => {
   let hidUdid = null;
   let hidOpen = null;
   let touchBeganAt = 0;
-  const activeDevice = () => devices.find((device) => device.state === "Booted" && device.udid === selected) ?? devices.find((device) => device.state === "Booted") ?? null;
+  const activeDevice = () => shownDevice(devices, selected);
   const refreshDevices = async (force = false) => {
     if (!force && Date.now() - devicesAt < DEVICE_POLL_MS - 100)
       return devices;
@@ -1764,7 +1807,13 @@ var createSimulator = () => {
   const switchStream = async () => {
     await refreshDevices(true);
     const device = activeDevice();
-    if (!device || device.udid === streamUdid || !viewerPresent())
+    if (!device) {
+      stopStream();
+      closeHid();
+      showPlaceholder();
+      return;
+    }
+    if (device.udid === streamUdid || !viewerPresent())
       return;
     await startStream(device);
   };
@@ -1796,8 +1845,9 @@ var createSimulator = () => {
           appearance = { udid: active.udid, value: await readAppearance(active.udid), at: Date.now() };
         }
       }
-      if (!selected || !devices.some((device) => device.udid === selected))
-        selected = defaultDevice(devices)?.udid ?? null;
+      if (!selected || !devices.some((device) => device.udid === selected)) {
+        selected = devices.find((device) => device.state === "Booted")?.udid ?? defaultDevice(devices)?.udid ?? null;
+      }
       return {
         devices,
         active,
@@ -1809,6 +1859,7 @@ var createSimulator = () => {
         appearance: active && appearance?.udid === active.udid ? appearance.value : "unknown",
         keyboard: active ? layouts.get(active.udid) ?? null : null,
         framed,
+        quality,
         error
       };
     },
@@ -1846,6 +1897,10 @@ var createSimulator = () => {
         hub.publish({ data: shown.data, mime: shown.mime, width: shown.width, height: shown.height, title: shown.title });
     },
     framed: () => framed,
+    quality: () => quality,
+    setQuality(next) {
+      quality = next;
+    },
     setFramed(on) {
       framed = on;
     },
@@ -1931,15 +1986,18 @@ var putBlob = (id, base64) => {
     blobs.delete(blobs.keys().next().value);
   return { id, length: base64.length };
 };
+var divisor = () => QUALITY_DIVISOR[sim.quality()];
 var chromes = new Map;
 var chromeForActive = () => {
   const type = sim.active()?.deviceType;
   if (!type)
     return null;
-  if (chromes.has(type))
-    return chromes.get(type) ?? null;
-  loadChrome(type).then((chrome) => {
-    chromes.set(type, chrome);
+  const at = divisor();
+  const key = `${type}@${at}`;
+  if (chromes.has(key))
+    return chromes.get(key) ?? null;
+  loadChrome(type, at).then((chrome) => {
+    chromes.set(key, chrome);
     if (chrome && sim.framed())
       sim.repaint();
   });
@@ -1950,6 +2008,7 @@ var presenter = createPresenter({
   pull: (after, waitMs) => sim.nextFrame(after, waitMs),
   orientation: () => sim.orientation(),
   framed: () => sim.framed(),
+  divisor,
   chrome: chromeForActive,
   background: () => background
 });
@@ -2037,13 +2096,16 @@ var handlePageFrame = async (_req, res, url) => {
     res.end();
     return;
   }
+  const picture = await presenter.forPage(frame);
+  if (res.destroyed)
+    return;
   const answer = {
     seq: frame.seq,
-    mime: frame.mime,
-    width: frame.width,
-    height: frame.height,
+    mime: picture.mime,
+    width: picture.width,
+    height: picture.height,
     degrees: frame.mime === "image/jpeg" ? rotationFor(sim.orientation()) : 0,
-    data: putBlob(`frame-${frame.seq}`, frame.data.toString("base64"))
+    data: putBlob(`frame-${frame.seq}`, picture.data.toString("base64"))
   };
   send(res, 200, answer);
 };
@@ -2057,7 +2119,8 @@ var handlePageInput = async (req, res) => {
   const current = sim.hub.current();
   if (!current || current.mime !== "image/jpeg")
     return send(res, 409, { error: "no simulator picture" });
-  if (current.width !== width || current.height !== height)
+  const expected = shrunkSize(current.width, current.height, divisor());
+  if (expected.width !== width || expected.height !== height)
     return send(res, 409, { error: "stale frame" });
   const layout = await sim.layout();
   const { messages, skippedChars } = translateInput(batch.events, { width, height }, pageInput, { layout });
@@ -2066,9 +2129,10 @@ var handlePageInput = async (req, res) => {
 };
 var handleChrome = async (_req, res) => {
   const type = sim.active()?.deviceType;
-  const chrome = type ? await loadChrome(type) : null;
+  const at = divisor();
+  const chrome = type ? await loadChrome(type, at) : null;
   if (type)
-    chromes.set(type, chrome);
+    chromes.set(`${type}@${at}`, chrome);
   const answer = chrome ? {
     available: true,
     layout: chrome.layout,
@@ -2100,6 +2164,7 @@ var routes = {
   "POST /surface/resize": async (_req, res) => send(res, 400, { error: "fixed size" }),
   "GET /surface/clipboard": async (_req, res) => send(res, 404, { error: "not supported" }),
   "GET /state": async (_req, res) => send(res, 200, await sim.state()),
+  "GET /stats": async (_req, res) => send(res, 200, { raw: sim.hub.current()?.seq ?? 0, shown: presenter.shown.current()?.seq ?? 0 }),
   "POST /select": async (req, res) => {
     const body = await readJson(req);
     if (typeof body.udid === "string")
@@ -2135,6 +2200,17 @@ var routes = {
     const body = await readJson(req);
     sim.setFramed(typeof body.on === "boolean" ? body.on : !sim.framed());
     sim.repaint();
+    send(res, 200, await sim.state());
+  },
+  "POST /quality": async (req, res) => {
+    const body = await readJson(req);
+    const next = QUALITIES.find((value) => value === body.value);
+    if (!next)
+      return send(res, 400, { error: `quality must be one of ${QUALITIES.join(", ")}` });
+    if (next !== sim.quality()) {
+      sim.setQuality(next);
+      sim.repaint();
+    }
     send(res, 200, await sim.state());
   },
   "POST /frame-style": async (req, res) => {

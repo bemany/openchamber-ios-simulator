@@ -21,6 +21,16 @@ export type KeyboardLayout = 'de' | 'us';
 
 export type Busy = 'booting' | 'shutting-down' | null;
 
+/** Picture size: full framebuffer, half or a third per side. Smaller is smoother over the network. */
+export type Quality = 'full' | 'balanced' | 'fast';
+
+export const QUALITIES: readonly Quality[] = ['full', 'balanced', 'fast'];
+
+/** Whole factor each side is divided by. */
+export const QUALITY_DIVISOR: Record<Quality, number> = { full: 1, balanced: 2, fast: 3 };
+
+export const DEFAULT_QUALITY: Quality = 'balanced';
+
 export type SimState = {
   devices: Device[];
   /** The booted device, or `null`. */
@@ -37,6 +47,7 @@ export type SimState = {
   keyboard: KeyboardLayout | null;
   /** The device frame is drawn around the picture (when Xcode has one for the device). */
   framed: boolean;
+  quality: Quality;
   /** Last error for display, or `null`. */
   error: string | null;
 };

@@ -2,7 +2,8 @@
 // picker, boot/shut down, Home, rotate, light/dark, lock, device frame, status.
 import type { HostClient } from '@openchamber/sdk';
 
-import type { SimState } from '../shared/state.ts';
+import { DIRECT_URL_KEY, normalizeDirectUrl } from '../shared/direct.ts';
+import { QUALITIES, type Quality, type SimState } from '../shared/state.ts';
 import type { FrameContext } from './host.ts';
 import { BASE_CSS, element, icon, installStyle, type IconName } from './ui.ts';
 
@@ -16,19 +17,34 @@ select:focus-visible,.ib:focus-visible{outline:2px solid var(--oc-focus);outline
 .ib.on{color:var(--oc-success-text)}
 .ib[aria-pressed="true"]{background:var(--oc-active)}
 .ib.pending{opacity:.6;cursor:progress}
+.ib.q{width:auto;padding:0 6px;font-size:11px;font-variant-numeric:tabular-nums}
 .sep{width:1px;height:18px;background:var(--oc-border);margin:0 2px;flex:none}
 .grow{flex:1;min-width:4px}
 .status{display:flex;align-items:center;gap:6px;color:var(--oc-muted);min-width:0;overflow:hidden}
 .status .text{overflow:hidden;text-overflow:ellipsis}
+.boot{flex:none;font:inherit;color:var(--oc-primary-foreground,#fff);background:var(--oc-primary);border:0;border-radius:var(--oc-radius,6px);height:24px;padding:0 10px;cursor:pointer}
+.boot:hover:not(:disabled){filter:brightness(1.08)}
+.boot:disabled{opacity:.6;cursor:progress}
 @media (max-width:370px){.status .text{display:none}}
 `;
 
 /** Instance storage: the device chosen last (preselected while nothing runs) and the frame switch. */
 const DEVICE_KEY = 'device';
 const FRAMED_KEY = 'framed';
+const QUALITY_KEY = 'quality';
+const QUALITY_LABEL: Record<Quality, string> = { full: '1:1', balanced: '1:2', fast: '1:3' };
+const nextQuality = (quality: Quality): Quality => QUALITIES[(QUALITIES.indexOf(quality) + 1) % QUALITIES.length]!;
 
-/** Builds the toolbar into `bar`; the answer draws it for a context. `host` is read lazily (it exists after `startFrame`). */
-export const createToolbar = (bar: HTMLElement, host: () => HostClient) => {
+export type ToolbarOptions = {
+  /** Where the serve-sim address can be edited (the full-screen page); without it the button explains where. */
+  onEditDirect?: () => void;
+};
+
+/**
+ * Builds the toolbar into `bar`; the answer draws it for a context and can be
+ * told a new serve-sim address. `host` is read lazily (it exists after `startFrame`).
+ */
+export const createToolbar = (bar: HTMLElement, host: () => HostClient, options: ToolbarOptions = {}) => {
   installStyle(TOOLBAR_CSS);
 
   const select = element('select');
@@ -44,11 +60,21 @@ export const createToolbar = (bar: HTMLElement, host: () => HostClient) => {
   const appearance = iconButton('contrast');
   const lock = iconButton('lock');
   const frame = iconButton('frame');
+  /** serve-sim's own interface in a tab of its own, at the address the user stored. */
+  const open = iconButton('external');
+  let directUrl: string | null = null;
+  /** Picture size; cycles full, half, third. */
+  const quality = element('button', 'ib q');
+  quality.type = 'button';
   const status = element('div', 'status');
   const dot = element('span', 'dot');
   const statusText = element('span', 'text');
   status.append(dot, statusText);
-  bar.append(select, power, element('span', 'sep'), home, rotate, appearance, lock, element('span', 'sep'), frame, element('span', 'grow'), status);
+  /** Shown when the chosen device is off: booting is always a deliberate click. */
+  const boot = element('button', 'boot');
+  boot.type = 'button';
+  boot.hidden = true;
+  bar.append(select, power, element('span', 'sep'), home, rotate, appearance, lock, element('span', 'sep'), frame, quality, open, element('span', 'grow'), status, boot);
 
   let context: FrameContext | null = null;
   let shownOptions = '';
@@ -61,10 +87,13 @@ export const createToolbar = (bar: HTMLElement, host: () => HostClient) => {
     const state = current();
     if (!context || !state) return;
     store(DEVICE_KEY, select.value);
-    // A running device shows at once; another boots next to the running ones; with none running the choice waits for the power button.
-    const target = state.devices.find((device) => device.udid === select.value);
-    if (target?.state === 'Booted' || !state.active) void context.act('/select', { udid: select.value });
-    else void context.act('/boot', { udid: select.value });
+    // A running device shows at once; one that is off shows as off and boots only from the Boot button.
+    void context.act('/select', { udid: select.value });
+  });
+  boot.addEventListener('click', () => {
+    const state = current();
+    if (!context || !state?.selected) return;
+    void context.act('/boot', { udid: state.selected });
   });
   power.addEventListener('click', () => {
     const state = current();
@@ -79,6 +108,21 @@ export const createToolbar = (bar: HTMLElement, host: () => HostClient) => {
   lock.addEventListener('click', () => void context?.act('/button', { name: 'lock' }));
   rotate.addEventListener('click', () => void context?.act('/rotate'));
   appearance.addEventListener('click', () => void context?.act('/appearance'));
+  open.addEventListener('click', () => {
+    if (directUrl) {
+      void host().openUrl(directUrl).catch(() => undefined);
+      return;
+    }
+    if (options.onEditDirect) options.onEditDirect();
+    else if (context) void host().toast({ kind: 'info', message: context.t.directMissing }).catch(() => undefined);
+  });
+  quality.addEventListener('click', () => {
+    const state = current();
+    if (!context || !state) return;
+    const next = nextQuality(state.quality);
+    store(QUALITY_KEY, next);
+    void context.act('/quality', { value: next });
+  });
   frame.addEventListener('click', () => {
     const state = current();
     if (!context || !state) return;
@@ -97,28 +141,39 @@ export const createToolbar = (bar: HTMLElement, host: () => HostClient) => {
     status.title = title;
   };
 
-  /** Once per load: the stored frame switch, and the stored device when nothing runs. */
+  /**
+   * Once per load: the stored frame switch, quality, and the stored device when
+   * nothing runs. One after the other, because `act` ignores a call while
+   * another is pending.
+   */
   const applyStored = (state: SimState) => {
     if (storedApplied) return;
     storedApplied = true;
-    void host()
-      .storage.get(FRAMED_KEY)
-      .then((framed) => {
-        if (typeof framed === 'boolean' && framed !== current()?.framed) void context?.act('/frame', { on: framed });
-      })
-      .catch(() => undefined);
-    if (state.active) return;
-    void host()
-      .storage.get(DEVICE_KEY)
-      .then((udid) => {
-        if (typeof udid === 'string' && udid !== state.selected && state.devices.some((device) => device.udid === udid)) {
-          void context?.act('/select', { udid });
-        }
-      })
-      .catch(() => undefined);
+    const read = (key: string) => host().storage.get(key).catch(() => undefined);
+    void (async () => {
+      const [framed, stored, udid, url] = await Promise.all([read(FRAMED_KEY), read(QUALITY_KEY), read(DEVICE_KEY), read(DIRECT_URL_KEY)]);
+      directUrl = normalizeDirectUrl(url);
+      if (typeof framed === 'boolean' && framed !== current()?.framed) await context?.act('/frame', { on: framed });
+      const value = QUALITIES.find((candidate) => candidate === stored);
+      if (value && value !== current()?.quality) await context?.act('/quality', { value });
+      if (!state.active && typeof udid === 'string' && udid !== state.selected && state.devices.some((device) => device.udid === udid)) {
+        await context?.act('/select', { udid });
+      }
+    })();
   };
 
-  return (next: FrameContext) => {
+  const drawBoot = (state: SimState | null, busy: boolean, t: FrameContext['t']) => {
+    const offer = !!state && state.active === null && state.busy !== 'shutting-down' && state.devices.some((device) => device.udid === state.selected);
+    boot.hidden = !offer;
+    // The button takes the status's place: the picker already names the device.
+    status.hidden = offer;
+    boot.disabled = busy;
+    boot.textContent = state?.busy === 'booting' ? t.booting : t.start;
+    const chosen = state?.devices.find((device) => device.udid === state.selected);
+    boot.title = chosen ? `${t.deviceOff(chosen.name)}. ${t.start}` : t.start;
+  };
+
+  const render = (next: FrameContext) => {
     context = next;
     const { view, t, pending } = next;
     label(select, t.device);
@@ -127,7 +182,9 @@ export const createToolbar = (bar: HTMLElement, host: () => HostClient) => {
     label(lock, t.lock);
 
     if (view.kind !== 'ready') {
-      for (const control of [select, power, home, rotate, appearance, lock, frame]) control.disabled = true;
+      boot.hidden = true;
+      status.hidden = false;
+      for (const control of [select, power, home, rotate, appearance, lock, frame, quality]) control.disabled = true;
       if (view.kind === 'loading') setStatus('', t.loading);
       else {
         const text = view.reason === 'not-granted' ? t.notGranted : view.reason === 'disabled' ? t.disabled : t.failed;
@@ -158,6 +215,7 @@ export const createToolbar = (bar: HTMLElement, host: () => HostClient) => {
 
     const busy = state.busy !== null || pending !== null;
     const live = state.active !== null;
+    drawBoot(state, busy, t);
     select.disabled = busy || state.devices.length === 0;
     power.disabled = busy || state.devices.length === 0;
     power.classList.toggle('on', live);
@@ -168,15 +226,32 @@ export const createToolbar = (bar: HTMLElement, host: () => HostClient) => {
     frame.disabled = pending === '/frame';
     frame.setAttribute('aria-pressed', String(state.framed));
     label(frame, state.framed ? t.frameHide : t.frameShow);
+    label(open, directUrl ? `${t.openDirect}: ${directUrl}` : t.openDirect);
+    quality.textContent = QUALITY_LABEL[state.quality];
+    quality.disabled = pending === '/quality';
+    label(quality, t.qualityNext(t.quality[state.quality], t.quality[nextQuality(state.quality)]));
 
     if (state.devices.length === 0) setStatus('error', t.noDevices);
     else if (state.busy === 'booting') setStatus('busy', t.booting);
     else if (state.busy === 'shutting-down') setStatus('busy', t.shuttingDown);
-    else if (!live) setStatus(state.error ? 'error' : '', t.noDevice, state.error ?? t.noDevice);
+    else if (!live) {
+      const chosen = state.devices.find((device) => device.udid === state.selected);
+      const text = chosen ? t.deviceOff(chosen.name) : t.noDevice;
+      setStatus(state.error ? 'error' : '', text, state.error ?? text);
+    }
     else if (state.error) setStatus('error', state.error);
     else {
       const control = state.controller === 'user' ? `, ${t.controlUser}` : state.controller === 'agent' ? `, ${t.controlAgent}` : '';
       setStatus(state.streaming ? 'on' : '', `${state.streaming ? t.live : t.noStream}${control}`);
     }
   };
+
+  return Object.assign(render, {
+    /** The address saved on the page, or `null` after removing it. */
+    setDirectUrl(url: string | null) {
+      directUrl = url;
+      if (context) render(context);
+    },
+    directUrl: () => directUrl,
+  });
 };

@@ -14,9 +14,9 @@ import {
   SURFACE_WIDTH_HEADER,
 } from '@openchamber/sdk';
 
-import { BLOB_CHUNK, type BlobRef, type ChromeAnswer, type Orientation, type PageFrame } from '../shared/state.ts';
+import { BLOB_CHUNK, QUALITIES, QUALITY_DIVISOR, type BlobRef, type ChromeAnswer, type Orientation, type PageFrame } from '../shared/state.ts';
 import { loadChrome, type ChromeAssets } from './chrome.ts';
-import { parseColor } from './compose.ts';
+import { parseColor, shrunkSize } from './compose.ts';
 import { translateInput, type InputState } from './input.ts';
 import { createPresenter, sameView } from './present.ts';
 import { rotationFor } from './rotate.ts';
@@ -53,14 +53,18 @@ const putBlob = (id: string, base64: string): BlobRef => {
   return { id, length: base64.length };
 };
 
-/** Loaded frames by device type; `null` where Xcode has none. */
+const divisor = () => QUALITY_DIVISOR[sim.quality()];
+
+/** Loaded frames by device type and size divisor; `null` where Xcode has none. */
 const chromes = new Map<string, ChromeAssets | null>();
 const chromeForActive = (): ChromeAssets | null => {
   const type = sim.active()?.deviceType;
   if (!type) return null;
-  if (chromes.has(type)) return chromes.get(type) ?? null;
-  void loadChrome(type).then((chrome) => {
-    chromes.set(type, chrome);
+  const at = divisor();
+  const key = `${type}@${at}`;
+  if (chromes.has(key)) return chromes.get(key) ?? null;
+  void loadChrome(type, at).then((chrome) => {
+    chromes.set(key, chrome);
     if (chrome && sim.framed()) sim.repaint();
   });
   return null;
@@ -71,6 +75,7 @@ const presenter = createPresenter({
   pull: (after, waitMs) => sim.nextFrame(after, waitMs),
   orientation: () => sim.orientation(),
   framed: () => sim.framed(),
+  divisor,
   chrome: chromeForActive,
   background: () => background,
 });
@@ -161,13 +166,15 @@ const handlePageFrame = async (_req: http.IncomingMessage, res: http.ServerRespo
     res.end();
     return;
   }
+  const picture = await presenter.forPage(frame);
+  if (res.destroyed) return;
   const answer: PageFrame = {
     seq: frame.seq,
-    mime: frame.mime,
-    width: frame.width,
-    height: frame.height,
+    mime: picture.mime,
+    width: picture.width,
+    height: picture.height,
     degrees: frame.mime === 'image/jpeg' ? rotationFor(sim.orientation()) : 0,
-    data: putBlob(`frame-${frame.seq}`, frame.data.toString('base64')),
+    data: putBlob(`frame-${frame.seq}`, picture.data.toString('base64')),
   };
   send(res, 200, answer);
 };
@@ -182,7 +189,9 @@ const handlePageInput = async (req: http.IncomingMessage, res: http.ServerRespon
   }
   const current = sim.hub.current();
   if (!current || current.mime !== 'image/jpeg') return send(res, 409, { error: 'no simulator picture' });
-  if (current.width !== width || current.height !== height) return send(res, 409, { error: 'stale frame' });
+  // The page draws pictures shrunk to the current quality; input on another size belongs to an older view.
+  const expected = shrunkSize(current.width, current.height, divisor());
+  if (expected.width !== width || expected.height !== height) return send(res, 409, { error: 'stale frame' });
   const layout = await sim.layout();
   const { messages, skippedChars } = translateInput(batch.events, { width, height }, pageInput, { layout });
   await sim.sendHid(messages);
@@ -191,8 +200,9 @@ const handlePageInput = async (req: http.IncomingMessage, res: http.ServerRespon
 
 const handleChrome = async (_req: http.IncomingMessage, res: http.ServerResponse) => {
   const type = sim.active()?.deviceType;
-  const chrome = type ? await loadChrome(type) : null;
-  if (type) chromes.set(type, chrome);
+  const at = divisor();
+  const chrome = type ? await loadChrome(type, at) : null;
+  if (type) chromes.set(`${type}@${at}`, chrome);
   const answer: ChromeAnswer = chrome
     ? {
         available: true,
@@ -231,6 +241,8 @@ const routes: Record<string, Route> = {
   'GET /surface/clipboard': async (_req, res) => send(res, 404, { error: 'not supported' }),
 
   'GET /state': async (_req, res) => send(res, 200, await sim.state()),
+  /** Counters for scripts/bench.mjs: raw frames from serve-sim and pictures prepared for the surface so far. */
+  'GET /stats': async (_req, res) => send(res, 200, { raw: sim.hub.current()?.seq ?? 0, shown: presenter.shown.current()?.seq ?? 0 }),
   'POST /select': async (req, res) => {
     const body = await readJson(req);
     if (typeof body.udid === 'string') await sim.select(body.udid);
@@ -263,6 +275,16 @@ const routes: Record<string, Route> = {
     const body = await readJson(req);
     sim.setFramed(typeof body.on === 'boolean' ? body.on : !sim.framed());
     sim.repaint();
+    send(res, 200, await sim.state());
+  },
+  'POST /quality': async (req, res) => {
+    const body = await readJson(req);
+    const next = QUALITIES.find((value) => value === body.value);
+    if (!next) return send(res, 400, { error: `quality must be one of ${QUALITIES.join(', ')}` });
+    if (next !== sim.quality()) {
+      sim.setQuality(next);
+      sim.repaint();
+    }
     send(res, 200, await sim.state());
   },
   /** The panel's background colour, behind the device frame. */

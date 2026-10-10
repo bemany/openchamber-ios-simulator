@@ -14,7 +14,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import type { ChromeButton, ChromeLayout, Rect } from '../shared/state.ts';
-import { drawOver, fillRect } from './compose.ts';
+import { drawOver, fillRect, shrunkSize } from './compose.ts';
 import { run } from './exec.ts';
 import { decodePng, encodePng, type Rgba } from './png.ts';
 import { listDeviceTypes, readPlist } from './simctl.ts';
@@ -265,7 +265,11 @@ const rasterize = async (pdf: string, key: string, width: number, height: number
 let deviceTypes: Promise<Map<string, string>> | null = null;
 const loading = new Map<string, Promise<ChromeAssets | null>>();
 
-const build = async (deviceType: string): Promise<ChromeAssets | null> => {
+/**
+ * Builds the frame for `deviceType`. With a `divisor` above 1 everything is
+ * laid out and rendered for a picture shrunk by it (see `shrunkSize`).
+ */
+const build = async (deviceType: string, divisor: number): Promise<ChromeAssets | null> => {
   deviceTypes ??= listDeviceTypes().catch((cause: unknown) => {
     deviceTypes = null;
     throw cause;
@@ -273,8 +277,9 @@ const build = async (deviceType: string): Promise<ChromeAssets | null> => {
   const bundle = (await deviceTypes).get(deviceType);
   if (!bundle) return null;
   const resources = join(bundle, 'Contents', 'Resources');
-  const display = parseDisplay(await readPlist(join(resources, 'capabilities.plist')));
-  if (!display) return null;
+  const full = parseDisplay(await readPlist(join(resources, 'capabilities.plist')));
+  if (!full) return null;
+  const display: Display = { ...full, ...shrunkSize(full.width, full.height, divisor), scale: full.scale / divisor };
   const chromeDir = join(CHROME_ROOT, `${display.chrome}.devicechrome`, 'Contents', 'Resources');
   const spec = parseChromeJson(JSON.parse(await readFile(join(chromeDir, 'chrome.json'), 'utf8')) as unknown);
   if (!spec) return null;
@@ -288,7 +293,8 @@ const build = async (deviceType: string): Promise<ChromeAssets | null> => {
     }
     return sizes.get(image) ?? null;
   };
-  const plan = planChrome(display.chrome, display, spec, sizeOf);
+  // The id names the size too, so layers cached for one quality never serve another.
+  const plan = planChrome(divisor > 1 ? `${display.chrome}@${divisor}` : display.chrome, display, spec, sizeOf);
   if (!plan) return null;
 
   const layer: Rgba = { width: plan.layout.width, height: plan.layout.height, data: new Uint8Array(plan.layout.width * plan.layout.height * 4) };
@@ -315,15 +321,16 @@ const build = async (deviceType: string): Promise<ChromeAssets | null> => {
   return { layout: plan.layout, layer, mask, maskPng, layerPng: () => (png ??= encodePng(layer)) };
 };
 
-/** Xcode's frame for a device type, or `null` when Xcode has none (or it cannot be read). */
-export const loadChrome = (deviceType: string): Promise<ChromeAssets | null> => {
-  let pending = loading.get(deviceType);
+/** Xcode's frame for a device type at a picture size divisor, or `null` when Xcode has none (or it cannot be read). */
+export const loadChrome = (deviceType: string, divisor = 1): Promise<ChromeAssets | null> => {
+  const key = `${deviceType}@${divisor}`;
+  let pending = loading.get(key);
   if (!pending) {
-    pending = build(deviceType).catch((cause: unknown) => {
+    pending = build(deviceType, divisor).catch((cause: unknown) => {
       console.error(`device frame for ${deviceType}: ${cause instanceof Error ? cause.message : String(cause)}`);
       return null;
     });
-    loading.set(deviceType, pending);
+    loading.set(key, pending);
   }
   return pending;
 };

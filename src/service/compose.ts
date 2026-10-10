@@ -118,6 +118,41 @@ export const placeScreen = (canvas: Rgba, frame: Rgba, screen: Rect, mask: Uint8
   }
 };
 
+/** Size after shrinking by a whole `divisor`, the same rounding everywhere (frames, device frame, input). */
+export const shrunkSize = (width: number, height: number, divisor: number) => ({
+  width: Math.floor(width / divisor),
+  height: Math.floor(height / divisor),
+});
+
+/** Shrinks by a whole factor, averaging each `divisor` x `divisor` block (box filter); the result is opaque. */
+export const shrink = (image: Rgba, divisor: number): Rgba => {
+  if (divisor <= 1) return image;
+  const { width, height } = shrunkSize(image.width, image.height, divisor);
+  const data = new Uint8Array(width * height * 4);
+  const area = divisor * divisor;
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      let r = 0;
+      let g = 0;
+      let b = 0;
+      for (let dy = 0; dy < divisor; dy += 1) {
+        let at = ((y * divisor + dy) * image.width + x * divisor) * 4;
+        for (let dx = 0; dx < divisor; dx += 1, at += 4) {
+          r += image.data[at]!;
+          g += image.data[at + 1]!;
+          b += image.data[at + 2]!;
+        }
+      }
+      const to = (y * width + x) * 4;
+      data[to] = Math.round(r / area);
+      data[to + 1] = Math.round(g / area);
+      data[to + 2] = Math.round(b / area);
+      data[to + 3] = 255;
+    }
+  }
+  return { width, height, data };
+};
+
 /** Turns RGBA clockwise by 90, 180 or 270 degrees. */
 export const rotateRgba = (image: Rgba, degrees: number): Rgba => {
   if (degrees !== 90 && degrees !== 180 && degrees !== 270) return image;

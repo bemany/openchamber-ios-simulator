@@ -5,7 +5,7 @@
 // running one. Nothing is shut down unless asked for.
 import http from 'node:http';
 
-import type { Appearance, Busy, Device, KeyboardLayout, Orientation, SimState } from '../shared/state.ts';
+import { DEFAULT_QUALITY, type Appearance, type Busy, type Device, type KeyboardLayout, type Orientation, type Quality, type SimState } from '../shared/state.ts';
 import { createFrameHub, type Frame } from './frames.ts';
 import { ensureHelper, helperBase } from './helper.ts';
 import { encodeHid, encodeMessage, OPCODE, type HidMessage } from './input.ts';
@@ -14,6 +14,7 @@ import { solidPng } from './placeholder.ts';
 import {
   bootDevice,
   defaultDevice,
+  shownDevice,
   listDevices,
   readAppearance,
   readKeyboardLayout,
@@ -50,6 +51,7 @@ export const createSimulator = () => {
   let helperPort: number | null = null;
   let lastViewerAt = 0;
   let framed = true;
+  let quality: Quality = DEFAULT_QUALITY;
 
   // Upstream MJPEG for exactly one device.
   let streamUdid: string | null = null;
@@ -64,10 +66,7 @@ export const createSimulator = () => {
   let hidOpen: Promise<WebSocket> | null = null;
   let touchBeganAt = 0;
 
-  const activeDevice = (): Device | null =>
-    devices.find((device) => device.state === 'Booted' && device.udid === selected) ??
-    devices.find((device) => device.state === 'Booted') ??
-    null;
+  const activeDevice = (): Device | null => shownDevice(devices, selected);
 
   const refreshDevices = async (force = false): Promise<Device[]> => {
     if (!force && Date.now() - devicesAt < DEVICE_POLL_MS - 100) return devices;
@@ -254,7 +253,14 @@ export const createSimulator = () => {
   const switchStream = async () => {
     await refreshDevices(true);
     const device = activeDevice();
-    if (!device || device.udid === streamUdid || !viewerPresent()) return;
+    if (!device) {
+      // The chosen device is off: stop showing the previous one.
+      stopStream();
+      closeHid();
+      showPlaceholder();
+      return;
+    }
+    if (device.udid === streamUdid || !viewerPresent()) return;
     await startStream(device);
   };
 
@@ -287,7 +293,9 @@ export const createSimulator = () => {
           appearance = { udid: active.udid, value: await readAppearance(active.udid), at: Date.now() };
         }
       }
-      if (!selected || !devices.some((device) => device.udid === selected)) selected = defaultDevice(devices)?.udid ?? null;
+      if (!selected || !devices.some((device) => device.udid === selected)) {
+        selected = devices.find((device) => device.state === 'Booted')?.udid ?? defaultDevice(devices)?.udid ?? null;
+      }
       return {
         devices,
         active,
@@ -299,6 +307,7 @@ export const createSimulator = () => {
         appearance: active && appearance?.udid === active.udid ? appearance.value : 'unknown',
         keyboard: active ? (layouts.get(active.udid) ?? null) : null,
         framed,
+        quality,
         error,
       };
     },
@@ -325,7 +334,7 @@ export const createSimulator = () => {
       });
     },
 
-    /** The toolbar's choice: shown at once when it runs, otherwise preselected for the power button. */
+    /** The toolbar's choice: shown at once when it runs; when it is off, shown as off until someone boots it. */
     async select(udid: string) {
       await refreshDevices();
       if (!devices.some((device) => device.udid === udid)) return;
@@ -340,6 +349,12 @@ export const createSimulator = () => {
     },
 
     framed: (): boolean => framed,
+
+    quality: (): Quality => quality,
+
+    setQuality(next: Quality) {
+      quality = next;
+    },
 
     setFramed(on: boolean) {
       framed = on;

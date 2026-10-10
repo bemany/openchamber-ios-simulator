@@ -30,6 +30,7 @@ await bundle('src/page/main.ts', 'page/main.js', 'browser');
 await bundle('src/service/main.ts', 'service/main.js', 'node');
 await bundle('src/service/compose-worker.ts', 'service/compose-worker.js', 'node');
 await copyFile(resolve(root, 'node_modules/@jsquash/jpeg/codec/dec/mozjpeg_dec.wasm'), resolve(dist, 'service/mozjpeg_dec.wasm'));
+await copyFile(resolve(root, 'node_modules/@jsquash/jpeg/codec/enc/mozjpeg_enc.wasm'), resolve(dist, 'service/mozjpeg_enc.wasm'));
 await copyFile(resolve(root, 'src/panel/index.html'), resolve(dist, 'panel/index.html'));
 await copyFile(resolve(root, 'src/status/index.html'), resolve(dist, 'status/index.html'));
 await copyFile(resolve(root, 'src/page/index.html'), resolve(dist, 'page/index.html'));

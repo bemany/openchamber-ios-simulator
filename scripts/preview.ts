@@ -38,6 +38,7 @@ const theme = { background:'#151313', elevated:'#1d1b1b', foreground:'#c9c5ba', 
 const envelope = { channel: 'openchamber.sdk', v: 1 };
 const frames = [...document.querySelectorAll('iframe')];
 const statusFrame = document.getElementById('status');
+const store = new Map();
 const log = (text) => { const node = document.getElementById('log'); if (node) node.textContent = new Date().toLocaleTimeString() + '  ' + text; };
 addEventListener('message', async (event) => {
   const message = event.data;
@@ -62,6 +63,18 @@ addEventListener('message', async (event) => {
     return;
   }
   if (message.type === 'toast') log('Toast: ' + (message.payload && message.payload.message));
+  // Instance storage in memory, shared by every frame of this preview, like the host's per-extension store.
+  if (message.type === 'storage') {
+    const { op, key, value } = message.payload;
+    if (op === 'set') store.set(key, value);
+    if (op === 'delete') store.delete(key);
+    const payload = op === 'get' ? { storage: true, op, found: store.has(key), value: store.get(key) }
+      : op === 'keys' ? { storage: true, op, keys: [...store.keys()] } : { storage: true, op };
+    reply({ ok: true, payload });
+    return;
+  }
+  // Logged only: the preview does not open anything.
+  if (message.type === 'open-url') log('openUrl: ' + message.payload.url);
   reply({ ok: true });
 });
 </script>`;

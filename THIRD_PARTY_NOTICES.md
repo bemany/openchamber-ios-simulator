@@ -6,7 +6,7 @@ This software is based in part on the work of the Independent JPEG Group.
 
 ## jpeg-js 0.4.4 (BSD-3-Clause)
 
-JPEG encoder used to write framed frames. https://github.com/jpeg-js/jpeg-js
+JPEG encoder for full-size pictures, and the fallback when the WebAssembly files are missing. https://github.com/jpeg-js/jpeg-js
 
 ```
 Copyright (c) 2014, Eugene Ware
@@ -39,7 +39,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ## @jsquash/jpeg 1.6.0 (Apache-2.0)
 
-MozJPEG decoder compiled to WebAssembly (`dist/service/mozjpeg_dec.wasm`). https://github.com/jamsinclair/jSquash
+MozJPEG decoder and encoder compiled to WebAssembly (`dist/service/mozjpeg_dec.wasm`, `dist/service/mozjpeg_enc.wasm`). https://github.com/jamsinclair/jSquash
 
 ```
                                  Apache License
@@ -248,7 +248,7 @@ MozJPEG decoder compiled to WebAssembly (`dist/service/mozjpeg_dec.wasm`). https
 
 ## MozJPEG / libjpeg-turbo (IJG, BSD-3-Clause, zlib)
 
-Inside the @jsquash/jpeg decoder. https://github.com/mozilla/mozjpeg
+Inside the @jsquash/jpeg decoder and encoder. https://github.com/mozilla/mozjpeg
 
 libjpeg-turbo Licenses
 ======================

@@ -49,6 +49,18 @@ export const parseDevices = (json: string): Device[] => {
   return devices;
 };
 
+/**
+ * The device shown: the chosen one while it runs. A chosen device that is off
+ * shows as off (the toolbar offers to boot it) instead of falling back to
+ * another running simulator. Without a (known) choice, any running device.
+ */
+export const shownDevice = (devices: Device[], selected: string | null): Device | null => {
+  if (selected && devices.some((device) => device.udid === selected)) {
+    return devices.find((device) => device.udid === selected && device.state === 'Booted') ?? null;
+  }
+  return devices.find((device) => device.state === 'Booted') ?? null;
+};
+
 /** Default pick with nothing booted and nothing chosen: a numbered iPhone, else any iPhone, else the first device. */
 export const defaultDevice = (devices: Device[]): Device | null =>
   devices.find((device) => /^iPhone \d/.test(device.name)) ??

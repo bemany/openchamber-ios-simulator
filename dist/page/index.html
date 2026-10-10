@@ -7,6 +7,15 @@
   </head>
   <body>
     <div id="bar"></div>
+    <div id="direct" role="group" hidden>
+      <label for="direct-url" id="direct-label"></label>
+      <input id="direct-url" type="text" inputmode="url" autocomplete="off" spellcheck="false" />
+      <button type="button" id="direct-save"></button>
+      <button type="button" id="direct-clear"></button>
+      <button type="button" id="direct-close"></button>
+      <span id="direct-error" hidden></span>
+      <p id="direct-hint"></p>
+    </div>
     <div id="stage" tabindex="0">
       <div id="device" hidden>
         <img id="layer" alt="" hidden />

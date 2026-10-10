@@ -1,5 +1,7 @@
 // Work Status section: which device runs and whether the stream is on.
+import type { SimState } from '../shared/state.ts';
 import { startFrame } from '../frame/host.ts';
+import type { Messages } from '../frame/messages.ts';
 import { BASE_CSS, element, installStyle } from '../frame/ui.ts';
 
 installStyle(`${BASE_CSS}
@@ -25,6 +27,12 @@ const row = (name: string, value: string, dot: '' | 'on' | 'busy' | 'error' | nu
   return node;
 };
 
+/** "iPhone 17 is off" for a chosen device that does not run, else "no simulator booted". */
+const offText = (state: SimState, t: Messages): string => {
+  const chosen = state.devices.find((device) => device.udid === state.selected);
+  return chosen ? t.deviceOff(chosen.name) : t.noDevice;
+};
+
 const host = startFrame(({ view, t }) => {
   if (view.kind === 'loading') {
     root.replaceChildren(row(t.device, t.loading));
@@ -46,7 +54,7 @@ const host = startFrame(({ view, t }) => {
       ? row(t.device, t.shuttingDown, 'busy')
       : state.active
         ? row(t.device, `${state.active.name} (${state.active.runtime})`, 'on')
-        : row(t.device, t.noDevice, '');
+        : row(t.device, offText(state, t), '');
   const stream = row(t.stream, state.streaming ? t.streamOn : t.streamOff, state.streaming ? 'on' : '');
   root.replaceChildren(device, stream);
 });

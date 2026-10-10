@@ -1,24 +1,31 @@
-// Between serve-sim's raw frames and what the surface shows: turns the picture
-// for landscape and, when the device frame is on, puts it into the frame.
+// Between serve-sim's raw frames and what the surface shows: shrinks the
+// picture to the chosen quality, turns it for landscape and, when the device
+// frame is on, puts it into the frame.
 // Works ahead on up to WORKERS frames at once and always takes the newest raw
 // frame, so a slow step skips frames instead of falling behind. Every shown
 // frame remembers its view (rotation, frame layout) so input lands on exactly
 // the picture it was made on.
+import { availableParallelism } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Worker } from 'node:worker_threads';
 
 import type { ChromeLayout, Orientation } from '../shared/state.ts';
 import type { ChromeAssets } from './chrome.ts';
-import { flatten } from './compose.ts';
+import { flatten, shrunkSize } from './compose.ts';
 import type { WorkerAnswer, WorkerCompose, WorkerLayer } from './compose-worker.ts';
 import { createFrameHub, type Frame, type FrameHub } from './frames.ts';
 import { rotatedSize, rotateJpeg, rotationFor } from './rotate.ts';
 
 export type View = { degrees: number; chrome: ChromeLayout | null };
 
-const WORKERS = 2;
-const QUALITY = 82;
+/**
+ * Compose workers: 2 to 4 by core count. Measured on an 18-core VM, framed at
+ * half size: 2 workers prepare about 24 of 30 frames a second, 3 or more keep up.
+ */
+const WORKERS = Math.min(4, Math.max(2, Math.floor(availableParallelism() / 3)));
+/** JPEG quality: full size keeps more detail; shrunk pictures are for speed. */
+const qualityFor = (divisor: number) => (divisor > 1 ? 75 : 82);
 /** The surface counts as watched for this long after its last frame request. */
 const VIEWER_GRACE_MS = 35_000;
 const PULL_WAIT_MS = 1_000;
@@ -59,9 +66,10 @@ const createPool = () => {
   };
 
   return {
-    compose(key: string, layer: () => Omit<WorkerLayer, 'type' | 'key'>, jpeg: Buffer, degrees: number): Promise<WorkerAnswer> {
+    /** One frame through a worker; `key` and `layer` give the device frame, or `null` for the bare picture. */
+    compose(key: string | null, layer: (() => Omit<WorkerLayer, 'type' | 'key'>) | null, jpeg: Buffer, divisor: number, degrees: number): Promise<WorkerAnswer> {
       const slot = workers.length < WORKERS ? spawn() : workers.reduce((a, b) => (b.busy < a.busy ? b : a));
-      if (!slot.layers.has(key)) {
+      if (key !== null && layer && !slot.layers.has(key)) {
         slot.worker.postMessage({ type: 'layer', key, ...layer() } satisfies WorkerLayer);
         slot.layers.add(key);
       }
@@ -69,7 +77,7 @@ const createPool = () => {
       slot.busy += 1;
       return new Promise((resolve) => {
         jobs.set(id, { worker: slot.worker, resolve });
-        const message: WorkerCompose = { type: 'compose', id, key, jpeg: new Uint8Array(jpeg), degrees, quality: QUALITY };
+        const message: WorkerCompose = { type: 'compose', id, key, jpeg: new Uint8Array(jpeg), divisor, degrees, quality: qualityFor(divisor) };
         slot.worker.postMessage(message);
       });
     },
@@ -85,7 +93,9 @@ export type PresenterDeps = {
   pull: (after: number, waitMs: number) => Promise<Frame | null>;
   orientation: () => Orientation | null;
   framed: () => boolean;
-  /** The frame for the active device when it is loaded; `null` without one. */
+  /** Shrink pictures by this whole factor (1 = full size). */
+  divisor: () => number;
+  /** The frame for the active device at the current divisor when it is loaded; `null` without one. */
   chrome: () => ChromeAssets | null;
   background: () => [number, number, number];
 };
@@ -118,24 +128,48 @@ export const createPresenter = (deps: PresenterDeps) => {
     };
   };
 
+  const fromAnswer = (answer: Extract<WorkerAnswer, { ok: true }>, title: string): Omit<Frame, 'seq'> => ({
+    data: Buffer.from(answer.jpeg.buffer, answer.jpeg.byteOffset, answer.jpeg.byteLength),
+    mime: 'image/jpeg',
+    width: answer.width,
+    height: answer.height,
+    title,
+  });
+
   const present = async (raw: Frame): Promise<{ frame: Omit<Frame, 'seq'>; view: View }> => {
     const plain = { data: raw.data, mime: raw.mime, width: raw.width, height: raw.height, title: raw.title };
     if (raw.mime !== 'image/jpeg') return { frame: plain, view: { degrees: 0, chrome: null } };
     const degrees = rotationFor(deps.orientation());
+    const divisor = deps.divisor();
+    const size = shrunkSize(raw.width, raw.height, divisor);
     const chrome = deps.framed() ? deps.chrome() : null;
-    if (chrome && chrome.layout.screen.width === raw.width && chrome.layout.screen.height === raw.height) {
+    if (chrome && chrome.layout.screen.width === size.width && chrome.layout.screen.height === size.height) {
       const { key, build } = layerFor(chrome, deps.background());
-      const answer = await pool.compose(key, build, raw.data, degrees);
-      if (answer.ok) {
-        return {
-          frame: { data: Buffer.from(answer.jpeg.buffer, answer.jpeg.byteOffset, answer.jpeg.byteLength), mime: 'image/jpeg', width: answer.width, height: answer.height, title: raw.title },
-          view: { degrees, chrome: chrome.layout },
-        };
-      }
+      const answer = await pool.compose(key, build, raw.data, divisor, degrees);
+      if (answer.ok) return { frame: fromAnswer(answer, raw.title), view: { degrees, chrome: chrome.layout } };
       console.error(`device frame: ${answer.error}`);
     }
+    if (divisor > 1) {
+      const answer = await pool.compose(null, null, raw.data, divisor, degrees);
+      if (answer.ok) return { frame: fromAnswer(answer, raw.title), view: { degrees, chrome: null } };
+      console.error(`shrink: ${answer.error}`);
+    }
+    // Full size: unchanged, or turned by sips (cheaper than decoding and encoding the whole picture).
     if (degrees === 0) return { frame: plain, view: { degrees, chrome: null } };
     return { frame: { ...plain, data: await rotateJpeg(raw.data, degrees), ...rotatedSize(raw, degrees) }, view: { degrees, chrome: null } };
+  };
+
+  /** The newest raw picture for the full-screen page: shrunk, never turned or framed (the page does that). Cached per frame. */
+  let pageCache: { seq: number; divisor: number; frame: Omit<Frame, 'seq'> } | null = null;
+  const forPage = async (raw: Frame): Promise<Omit<Frame, 'seq'>> => {
+    const divisor = deps.divisor();
+    const plain = { data: raw.data, mime: raw.mime, width: raw.width, height: raw.height, title: raw.title };
+    if (raw.mime !== 'image/jpeg' || divisor <= 1) return plain;
+    if (pageCache?.seq === raw.seq && pageCache.divisor === divisor) return pageCache.frame;
+    const answer = await pool.compose(null, null, raw.data, divisor, 0);
+    if (!answer.ok) return plain;
+    pageCache = { seq: raw.seq, divisor, frame: fromAnswer(answer, raw.title) };
+    return pageCache.frame;
   };
 
   const submit = (raw: Frame) => {
@@ -183,6 +217,7 @@ export const createPresenter = (deps: PresenterDeps) => {
       return shown.next(after, waitMs, signal);
     },
     viewOf: (seq: number): View | undefined => views.get(seq),
+    forPage,
     currentView(): View {
       const current = shown.current();
       return (current && views.get(current.seq)) ?? { degrees: 0, chrome: null };
