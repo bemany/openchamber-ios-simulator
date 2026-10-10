@@ -135,7 +135,7 @@ export const createToolbar = (bar: HTMLElement, host: () => HostClient, options:
     node.setAttribute('aria-label', text);
   };
 
-  /** While a button is hovered on a host without popovers, the status shows its name instead. */
+  /** While a button is hovered or focused, the status shows its name instead (the native tooltip comes later). */
   let hint: string | null = null;
   let statusShown = '';
   const setStatus = (kind: '' | 'on' | 'busy' | 'error', text: string, title = text) => {
@@ -144,11 +144,9 @@ export const createToolbar = (bar: HTMLElement, host: () => HostClient, options:
     statusText.textContent = hint ?? text;
     status.title = title;
   };
-  // After the frame's module has run: `host()` only exists once `startFrame` returned,
-  // and the page adds its own buttons (the address row's link button) after the toolbar.
+  // After the frame's module has run: the page adds its own buttons (the address row's link button) after the toolbar.
   setTimeout(() =>
     attachTooltips({
-      host,
       buttons: () => [...bar.querySelectorAll<HTMLElement>('button.ib')],
       showInStatus: (text) => {
         hint = text;

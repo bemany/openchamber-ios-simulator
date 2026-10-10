@@ -327,10 +327,4 @@ const host: HostClient = startFrame((next) => {
   layout();
 });
 
-// Not in a tooltip popover frame (same entry, opened by the host): only a real page pulls pictures.
-let pumping = false;
-host.onReady((context) => {
-  if (pumping || context.surface === 'popover') return;
-  pumping = true;
-  void pump();
-});
+void pump();

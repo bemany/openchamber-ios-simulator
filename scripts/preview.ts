@@ -40,8 +40,8 @@ const frames = [...document.querySelectorAll('iframe')];
 const statusFrame = document.getElementById('status');
 const dockFrame = document.getElementById('dock');
 const store = new Map();
-// Popovers like the host's (tooltips): a frame of the same entry next to the anchor. ?nopopovers turns them off.
-const popovers = !location.search.includes('nopopovers');
+// Popovers like the host's: a frame of the same entry next to the anchor. Off unless ?popovers (the extension uses none).
+const popovers = location.search.includes('popovers');
 let popover = null;
 const closePopover = () => { if (popover) { popover.frame.remove(); frames.splice(frames.indexOf(popover.frame), 1); popover = null; } };
 const log = (text) => { const node = document.getElementById('log'); if (node) node.textContent = new Date().toLocaleTimeString() + '  ' + text; };

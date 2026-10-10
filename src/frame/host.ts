@@ -3,7 +3,6 @@ import { applyHostReady } from '@openchamber/sdk/ui';
 
 import type { SimState } from '../shared/state.ts';
 import { messagesFor, type Messages } from './messages.ts';
-import { renderTooltipPopover } from './tooltip.ts';
 
 export type ViewState =
   | { kind: 'loading' }
@@ -56,16 +55,12 @@ export const startFrame = (render: (context: FrameContext) => void, options: Fra
   let t = messagesFor(navigator.language || 'en');
   let pending: string | null = null;
   let timer: ReturnType<typeof setTimeout> | null = null;
-  /** This frame was opened by the host as a tooltip popover: it shows only the card. */
-  let popover = false;
 
-  const draw = () => {
-    if (!popover) render({ view, t, act, pending });
-  };
+  const draw = () => render({ view, t, act, pending });
 
   const schedule = () => {
     if (timer) clearTimeout(timer);
-    if (popover || document.visibilityState !== 'visible') return;
+    if (document.visibilityState !== 'visible') return;
     const busy = view.kind === 'ready' && view.state.busy !== null;
     timer = setTimeout(poll, busy || pending ? POLL_BUSY_MS : POLL_MS);
   };
@@ -104,11 +99,6 @@ export const startFrame = (render: (context: FrameContext) => void, options: Fra
 
   host.onReady((context) => {
     applyHostReady(context, document.documentElement);
-    if (popover || renderTooltipPopover(context, host)) {
-      popover = true;
-      if (timer) clearTimeout(timer);
-      return;
-    }
     t = messagesFor(context.locale);
     document.documentElement.lang = context.locale;
     options.onReady?.(context);
