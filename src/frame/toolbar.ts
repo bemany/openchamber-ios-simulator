@@ -5,6 +5,7 @@ import type { HostClient } from '@openchamber/sdk';
 import { DIRECT_URL_KEY, normalizeDirectUrl } from '../shared/direct.ts';
 import { QUALITIES, type Quality, type SimState } from '../shared/state.ts';
 import type { FrameContext } from './host.ts';
+import { attachTooltips } from './tooltip.ts';
 import { BASE_CSS, element, icon, installStyle, type IconName } from './ui.ts';
 
 export const TOOLBAR_CSS = `${BASE_CSS}
@@ -134,11 +135,27 @@ export const createToolbar = (bar: HTMLElement, host: () => HostClient, options:
     node.setAttribute('aria-label', text);
   };
 
+  /** While a button is hovered on a host without popovers, the status shows its name instead. */
+  let hint: string | null = null;
+  let statusShown = '';
   const setStatus = (kind: '' | 'on' | 'busy' | 'error', text: string, title = text) => {
     dot.className = `dot${kind ? ` ${kind}` : ''}`;
-    statusText.textContent = text;
+    statusShown = text;
+    statusText.textContent = hint ?? text;
     status.title = title;
   };
+  // After the frame's module has run: `host()` only exists once `startFrame` returned,
+  // and the page adds its own buttons (the address row's link button) after the toolbar.
+  setTimeout(() =>
+    attachTooltips({
+      host,
+      buttons: () => [...bar.querySelectorAll<HTMLElement>('button.ib')],
+      showInStatus: (text) => {
+        hint = text;
+        statusText.textContent = hint ?? statusShown;
+      },
+    }),
+  );
 
   /**
    * Once per load: the stored frame switch, quality, and the stored device when

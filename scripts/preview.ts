@@ -40,6 +40,10 @@ const frames = [...document.querySelectorAll('iframe')];
 const statusFrame = document.getElementById('status');
 const dockFrame = document.getElementById('dock');
 const store = new Map();
+// Popovers like the host's (tooltips): a frame of the same entry next to the anchor. ?nopopovers turns them off.
+const popovers = !location.search.includes('nopopovers');
+let popover = null;
+const closePopover = () => { if (popover) { popover.frame.remove(); frames.splice(frames.indexOf(popover.frame), 1); popover = null; } };
 const log = (text) => { const node = document.getElementById('log'); if (node) node.textContent = new Date().toLocaleTimeString() + '  ' + text; };
 addEventListener('message', async (event) => {
   const message = event.data;
@@ -47,10 +51,28 @@ addEventListener('message', async (event) => {
   if (!frame || !message || message.channel !== 'openchamber.sdk') return;
   const reply = (body) => frame.contentWindow.postMessage({ ...envelope, type: 'result', id: message.id, ...body }, '*');
   if (message.type === 'hello') {
+    const isPopover = popover && frame === popover.frame;
     frame.contentWindow.postMessage({ ...envelope, type: 'ready', payload: { theme: { mode: 'dark', tokens: theme }, locale: 'de',
-      directory: null, session: null, surface: frame.dataset.surface, connection: { connected: false, account: null }, settings: {}, item: null } }, '*');
+      directory: null, session: null, surface: isPopover ? 'popover' : frame.dataset.surface, connection: { connected: false, account: null }, settings: {}, item: null,
+      ...(isPopover ? { popover: { id: popover.id, data: popover.data } } : {}), features: popovers ? { popovers: true } : {} } }, '*');
     return;
   }
+  if (message.type === 'resize' && popover && frame === popover.frame) popover.frame.style.height = message.payload.height + 'px';
+  if (message.type === 'popover-open' && popovers) {
+    closePopover();
+    const { id, anchor, width, height, data } = message.payload;
+    const box = frame.getBoundingClientRect();
+    const child = document.createElement('iframe');
+    child.setAttribute('sandbox', 'allow-scripts');
+    child.className = 'popover';
+    child.src = frame.src;
+    Object.assign(child.style, { position: 'fixed', left: (box.left + anchor.x + anchor.width / 2 - width / 2) + 'px', top: (box.top + anchor.y + anchor.height + 6) + 'px', width: width + 'px', height: height + 'px', border: '1px solid #2f2c2c', borderRadius: '6px', zIndex: 10 });
+    document.body.append(child);
+    frames.push(child);
+    popover = { id, data, frame: child };
+    log('popover: ' + JSON.stringify(data));
+  }
+  if (message.type === 'popover-close') closePopover();
   if (message.type === 'resize' && statusFrame && frame === statusFrame) statusFrame.style.height = Math.max(24, Math.min(200, message.payload.height)) + 'px';
   // The docked toolbar grows like in OpenChamber: at least 24 px, at most half the panel.
   if (message.type === 'resize' && dockFrame && frame === dockFrame) dockFrame.style.height = Math.max(24, Math.min(innerHeight / 2, message.payload.height)) + 'px';
