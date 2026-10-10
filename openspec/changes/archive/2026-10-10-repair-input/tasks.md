@@ -17,4 +17,4 @@
 ## 4. Docs and release
 
 - [x] 4.1 README: feature line, troubleshooting row "Touch does nothing, buttons work", note that the user's own serve-sim on another interface needs its own restart; German section
-- [ ] 4.2 `bun run check`, `node scripts/smoke.mjs`, commit with `dist/`, release after the owner's go, close #8 when the change is archived
+- [x] 4.2 `bun run check`, `node scripts/smoke.mjs`, commit with `dist/`, release after the owner's go, close #8 when the change is archived
