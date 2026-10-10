@@ -1,0 +1,66 @@
+{
+  "name": "openchamber-ios-simulator",
+  "version": "0.1.0",
+  "description": "OpenChamber extension that shows the iOS Simulator live in a panel and lets you use it (built on serve-sim).",
+  "license": "MIT",
+  "private": true,
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/bemany/openchamber-ios-simulator.git"
+  },
+  "keywords": [
+    "openchamber",
+    "openchamber-extension",
+    "ios",
+    "simulator",
+    "serve-sim"
+  ],
+  "type": "module",
+  "scripts": {
+    "build": "bun scripts/build.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "smoke": "node scripts/smoke.mjs",
+    "check": "bun run typecheck && bun test && bun run build",
+    "preview": "bun scripts/preview.ts"
+  },
+  "openchamber": {
+    "apiVersion": 1,
+    "engines": {
+      "openchamber": ">=2.2.0"
+    },
+    "contributes": {
+      "panel": {
+        "id": "ios-simulator",
+        "name": "iOS Simulator",
+        "icon": "icon.svg",
+        "entry": "dist/panel/index.html",
+        "dock": "top",
+        "size": 44
+      },
+      "statusSection": {
+        "entry": "dist/status/index.html",
+        "title": "iOS Simulator",
+        "height": 56
+      },
+      "service": {
+        "entry": "dist/service/main.js",
+        "runtime": "host",
+        "surface": true,
+        "permissions": {
+          "exec": [
+            "xcrun",
+            "serve-sim",
+            "sips"
+          ]
+        }
+      }
+    }
+  },
+  "devDependencies": {
+    "@openchamber/sdk": "^2.2.0",
+    "@types/bun": "^1.4.2",
+    "@types/node": "^26.6.4",
+    "typescript": "^7.0.2"
+  }
+}

@@ -1,0 +1,59 @@
+// Interface text: German for `de*` locales, English otherwise.
+
+const en = {
+  device: 'Device',
+  start: 'Boot',
+  stop: 'Shut down',
+  home: 'Home',
+  rotate: 'Rotate',
+  appearanceToLight: 'Light appearance',
+  appearanceToDark: 'Dark appearance',
+  lock: 'Lock',
+  running: 'running',
+  booting: 'Booting ...',
+  shuttingDown: 'Shutting down ...',
+  live: 'Live',
+  noStream: 'No stream',
+  noDevice: 'No simulator booted',
+  noDevices: 'No iOS simulators installed',
+  stream: 'Stream',
+  streamOn: 'on',
+  streamOff: 'off',
+  controlUser: 'you are in control',
+  controlAgent: 'agent in control',
+  loading: 'Loading ...',
+  notGranted: 'Service not approved yet (Settings > Extensions).',
+  disabled: 'Extension is paused.',
+  failed: 'Service unavailable.',
+};
+
+export type Messages = typeof en;
+
+const de: Messages = {
+  device: 'Gerät',
+  start: 'Starten',
+  stop: 'Beenden',
+  home: 'Home',
+  rotate: 'Drehen',
+  appearanceToLight: 'Helles Erscheinungsbild',
+  appearanceToDark: 'Dunkles Erscheinungsbild',
+  lock: 'Sperren',
+  running: 'läuft',
+  booting: 'Startet ...',
+  shuttingDown: 'Fährt herunter ...',
+  live: 'Live',
+  noStream: 'Kein Stream',
+  noDevice: 'Kein Simulator gebootet',
+  noDevices: 'Keine iOS-Simulatoren installiert',
+  stream: 'Stream',
+  streamOn: 'an',
+  streamOff: 'aus',
+  controlUser: 'du bedienst',
+  controlAgent: 'Agent bedient',
+  loading: 'Lade ...',
+  notGranted: 'Dienst noch nicht freigegeben (Einstellungen > Extensions).',
+  disabled: 'Extension ist pausiert.',
+  failed: 'Dienst nicht erreichbar.',
+};
+
+export const messagesFor = (locale: string): Messages => (locale.toLowerCase().startsWith('de') ? de : en);
