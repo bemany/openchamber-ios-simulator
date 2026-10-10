@@ -1,0 +1,54 @@
+schema: spec-driven
+
+context: |
+  Language: English
+  All artifacts must be written in English.
+  Keep OpenSpec structural headings and SHALL/MUST keywords in English.
+
+  Project: OpenChamber extension "iOS Simulator" (public repo, MIT). Shows the
+  iOS Simulator of the machine OpenChamber runs on in a rail panel (OpenChamber
+  shared surface plus a docked toolbar), a full-screen extension page and a Work
+  Status section, and forwards touch, keys and hardware buttons to it.
+
+  Stack: TypeScript, bun (build, tests), OpenChamber SDK 2.2 (@openchamber/sdk).
+  The Node service (src/service/, runs on 127.0.0.1 behind the host token) talks
+  to serve-sim (npm, EvanBacon/serve-sim) over MJPEG and its HID WebSocket, and
+  to xcrun simctl. Frames are composed in worker threads (MozJPEG WASM, jpeg-js).
+  Frames (src/panel, src/page, src/status) are sandboxed iframes: classic IIFE
+  bundles, no ESM, no allow-forms, no allow-modals, strict guest CSP (no foreign
+  frames or connections). serviceRequest answers are cut at 256 000 characters.
+
+  Rules that every change keeps:
+  - serve-sim is only ever bound to 127.0.0.1; never start or reuse a serve-sim
+    server on another interface (its page carries a shell-route token).
+  - Never boot a simulator unasked; several simulators may run at once.
+  - Never ship Apple artwork; the device frame is read from the local Xcode.
+  - No private data (IPs, UDIDs, personal paths, private project names) in the repo.
+  - `bun run check` green and `dist/` committed with the sources; measure speed
+    claims with scripts/bench.mjs; verify on a real simulator (scripts/smoke.mjs,
+    bun run preview).
+  - Interface text in English and German; no em dashes in any text.
+  - Planned work is tracked as GitHub issues in bemany/openchamber-ios-simulator;
+    a change names its issue in the proposal.
+
+# Per-artifact rules (optional)
+# Add custom rules for specific artifacts.
+# Example:
+#   rules:
+#     proposal:
+#       - Keep proposals under 500 words
+#       - Always include a "Non-goals" section
+#     tasks:
+#       - Break tasks into chunks of max 2 hours
+
+# Per-operation guidance (optional)
+# Add advisory guidance for how apply and archive work should be conducted.
+# This is separate from artifact rules above.
+# Example:
+#   operations:
+#     apply:
+#       guidance:
+#         - Keep test summaries concise
+#     archive:
+#       guidance:
+#         - Summarize the archive outcome before finishing
