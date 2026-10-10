@@ -36,15 +36,15 @@ const QUALITY_LABEL: Record<Quality, string> = { full: '1:1', balanced: '1:2', f
 const nextQuality = (quality: Quality): Quality => QUALITIES[(QUALITIES.indexOf(quality) + 1) % QUALITIES.length]!;
 
 export type ToolbarOptions = {
-  /** Where the serve-sim address can be edited (the full-screen page); without it the button explains where. */
-  onEditDirect?: () => void;
+  /** Opens the serve-sim address row; the open button calls it while no address is stored. */
+  onEditDirect: () => void;
 };
 
 /**
  * Builds the toolbar into `bar`; the answer draws it for a context and can be
  * told a new serve-sim address. `host` is read lazily (it exists after `startFrame`).
  */
-export const createToolbar = (bar: HTMLElement, host: () => HostClient, options: ToolbarOptions = {}) => {
+export const createToolbar = (bar: HTMLElement, host: () => HostClient, options: ToolbarOptions) => {
   installStyle(TOOLBAR_CSS);
 
   const select = element('select');
@@ -113,8 +113,7 @@ export const createToolbar = (bar: HTMLElement, host: () => HostClient, options:
       void host().openUrl(directUrl).catch(() => undefined);
       return;
     }
-    if (options.onEditDirect) options.onEditDirect();
-    else if (context) void host().toast({ kind: 'info', message: context.t.directMissing }).catch(() => undefined);
+    options.onEditDirect();
   });
   quality.addEventListener('click', () => {
     const state = current();

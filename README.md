@@ -70,7 +70,7 @@ Before: one frame size, two compose workers, jpeg-js. After: shrinking in 2 to 4
    As with every OpenChamber service, the list is shown for approval but does not sandbox the process: it runs with your user's access.
 
 4. The rail icon **iOS Simulator** appears on the right-hand rail; the full-screen page appears under **Extension pages** above the session list; the Work Status section shows the device.
-5. Optional: on the full-screen page, the link button stores a serve-sim address for **Open in serve-sim**.
+5. Optional: the link button in the toolbar (panel or page) opens a row under the toolbar to store a serve-sim address for **Open in serve-sim**.
 
 ## Develop
 
@@ -143,7 +143,7 @@ All behind the host's token, on `127.0.0.1`:
 | *No stream*, or an error about serve-sim | No serve-sim helper on loopback could be started | `npm install -g serve-sim`; check `$TMPDIR/openchamber-ios-simulator-serve-sim.log` |
 | Taps do nothing | serve-sim's input is shadowed by Device Hub | `serve-sim repair-input` (restarts SpringBoard), then reopen the panel |
 | Picture stutters over the network | Large frames | Use **1:2** or **1:3**, or hide the device frame |
-| **Open in serve-sim** only shows a hint | No address stored yet | Full-screen page > link button > enter the address > **Save** |
+| **Open in serve-sim** opens the address row | No address stored yet | Enter the address in the row under the toolbar, then **Save** (or Enter) |
 | Typed characters come out wrong | The simulator's hardware keyboard layout is neither German nor US | Typed as US for now (see the issues) |
 
 ## Limitations

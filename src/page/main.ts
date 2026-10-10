@@ -7,8 +7,8 @@ import type { HostClient, SurfaceInputEvent, SurfaceModifiers } from '@openchamb
 
 import { startFrame, type FrameContext } from '../frame/host.ts';
 import { createToolbar } from '../frame/toolbar.ts';
-import { icon, installStyle } from '../frame/ui.ts';
-import { DIRECT_URL_KEY, normalizeDirectUrl } from '../shared/direct.ts';
+import { createDirectEditor } from '../frame/direct-editor.ts';
+import { installStyle } from '../frame/ui.ts';
 import { BLOB_CHUNK, type BlobRef, type ChromeAnswer, type ChromeButton, type ChromeLayout, type PageFrame, type Rect } from '../shared/state.ts';
 
 installStyle(`
@@ -20,12 +20,6 @@ body{display:flex;flex-direction:column}
 #layer{position:absolute;left:0;top:0;width:100%;height:100%;pointer-events:none;user-select:none;-webkit-user-drag:none}
 #screen{position:absolute;touch-action:none;cursor:pointer;-webkit-mask-size:100% 100%;mask-size:100% 100%}
 #empty{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--oc-muted)}
-#direct{flex:none;display:flex;flex-wrap:wrap;align-items:center;gap:6px;padding:8px;border-bottom:1px solid var(--oc-border)}
-#direct input{font:inherit;color:var(--oc-fg);background:var(--oc-elevated,transparent);border:1px solid var(--oc-border);border-radius:var(--oc-radius,6px);height:26px;padding:0 8px;flex:1 1 220px;min-width:0}
-#direct button{font:inherit;color:var(--oc-fg);background:transparent;border:1px solid var(--oc-border);border-radius:var(--oc-radius,6px);height:26px;padding:0 10px;cursor:pointer}
-#direct-save{background:var(--oc-primary);color:var(--oc-primary-foreground,#fff);border-color:transparent}
-#direct-error{color:var(--oc-error-text)}
-#direct-hint{flex-basis:100%;margin:2px 0 0;color:var(--oc-warning-text);font-size:11px;line-height:1.45}
 `);
 
 const byId = <T extends HTMLElement>(id: string): T => {
@@ -53,58 +47,9 @@ let chromeKey = '';
 /** What the device element is laid out for, so it is only redone on change. */
 let laidOut = '';
 
-// The serve-sim address for the toolbar's "Open in serve-sim" button: edited here, stored per instance.
-// A plain group, not a <form>: the sandbox (no allow-forms) blocks form submission outright.
-const directForm = byId<HTMLElement>('direct');
-const directInput = byId<HTMLInputElement>('direct-url');
-const directError = byId<HTMLElement>('direct-error');
-const showDirect = (visible: boolean) => {
-  directForm.hidden = !visible;
-  directError.hidden = true;
-  if (visible) {
-    directInput.value = toolbar.directUrl() ?? '';
-    directInput.focus();
-  }
-};
-const toolbar = createToolbar(bar, () => host, { onEditDirect: () => showDirect(true) });
-const editDirect = document.createElement('button');
-editDirect.type = 'button';
-editDirect.className = 'ib';
-editDirect.append(icon('link'));
-editDirect.addEventListener('click', () => showDirect(directForm.hidden !== false));
-bar.insertBefore(editDirect, bar.querySelector('.grow'));
-const saveDirect = () => {
-  const url = normalizeDirectUrl(directInput.value);
-  if (!url) {
-    directError.hidden = false;
-    return;
-  }
-  void host.storage.set(DIRECT_URL_KEY, url).catch(() => undefined);
-  toolbar.setDirectUrl(url);
-  showDirect(false);
-};
-byId<HTMLButtonElement>('direct-save').addEventListener('click', saveDirect);
-directInput.addEventListener('keydown', (event) => {
-  if (event.key === 'Enter') saveDirect();
-  if (event.key === 'Escape') showDirect(false);
-});
-byId<HTMLButtonElement>('direct-clear').addEventListener('click', () => {
-  void host.storage.delete(DIRECT_URL_KEY).catch(() => undefined);
-  toolbar.setDirectUrl(null);
-  showDirect(false);
-});
-byId<HTMLButtonElement>('direct-close').addEventListener('click', () => showDirect(false));
-const labelDirect = (t: FrameContext['t']) => {
-  editDirect.title = t.directEdit;
-  editDirect.setAttribute('aria-label', t.directEdit);
-  byId('direct-label').textContent = t.directLabel;
-  directInput.placeholder = t.directPlaceholder;
-  byId('direct-save').textContent = t.directSave;
-  byId('direct-clear').textContent = t.directClear;
-  byId('direct-close').textContent = t.directClose;
-  directError.textContent = t.directInvalid;
-  byId('direct-hint').textContent = t.directHint;
-};
+// The serve-sim address for the toolbar's "Open in serve-sim" button, edited in a row under the toolbar.
+const toolbar = createToolbar(bar, () => host, { onEditDirect: () => direct.show(true) });
+const direct = createDirectEditor({ bar, host: () => host, toolbar: () => toolbar });
 
 /** Fetches a blob's parts in parallel and joins them. */
 const readBlob = async (ref: BlobRef): Promise<string> => {
@@ -370,7 +315,7 @@ stage.addEventListener('paste', (event) => {
 const host: HostClient = startFrame((next) => {
   context = next;
   toolbar(next);
-  labelDirect(next.t);
+  direct.label(next.t);
   const { view, t } = next;
   const chosen = view.kind === 'ready' ? view.state.devices.find((device) => device.udid === view.state.selected) : undefined;
   empty.textContent = view.kind === 'ready' ? (view.state.active ? '' : chosen ? t.deviceOff(chosen.name) : t.noDevice) : t.loading;

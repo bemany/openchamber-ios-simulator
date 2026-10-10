@@ -38,6 +38,7 @@ const theme = { background:'#151313', elevated:'#1d1b1b', foreground:'#c9c5ba', 
 const envelope = { channel: 'openchamber.sdk', v: 1 };
 const frames = [...document.querySelectorAll('iframe')];
 const statusFrame = document.getElementById('status');
+const dockFrame = document.getElementById('dock');
 const store = new Map();
 const log = (text) => { const node = document.getElementById('log'); if (node) node.textContent = new Date().toLocaleTimeString() + '  ' + text; };
 addEventListener('message', async (event) => {
@@ -51,6 +52,8 @@ addEventListener('message', async (event) => {
     return;
   }
   if (message.type === 'resize' && statusFrame && frame === statusFrame) statusFrame.style.height = Math.max(24, Math.min(200, message.payload.height)) + 'px';
+  // The docked toolbar grows like in OpenChamber: at least 24 px, at most half the panel.
+  if (message.type === 'resize' && dockFrame && frame === dockFrame) dockFrame.style.height = Math.max(24, Math.min(innerHeight / 2, message.payload.height)) + 'px';
   if (!message.id) return;
   if (message.type === 'service-request') {
     const { method, path, body, query } = message.payload;
