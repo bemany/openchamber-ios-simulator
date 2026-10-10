@@ -1373,22 +1373,31 @@ var isLoopbackUrl = (url) => {
     return false;
   }
 };
-var portsFromStateFiles = (dir = join5(tmpdir4(), "serve-sim")) => {
-  const ports = [];
+var helpersFromStateFiles = (dir = join5(tmpdir4(), "serve-sim")) => {
+  const helpers = [];
   let names = [];
   try {
     names = readdirSync(dir).filter((name) => name.startsWith("server-") && name.endsWith(".json"));
   } catch {
-    return ports;
+    return helpers;
   }
   for (const name of names) {
     try {
       const state = JSON.parse(readFileSync2(join5(dir, name), "utf8"));
-      if (typeof state.url === "string" && isLoopbackUrl(state.url) && typeof state.port === "number")
-        ports.push(state.port);
+      if (typeof state.url !== "string" || !isLoopbackUrl(state.url) || typeof state.port !== "number" || typeof state.device !== "string")
+        continue;
+      helpers.push({ port: state.port, device: state.device });
     } catch {}
   }
-  return ports;
+  return helpers;
+};
+var candidatePorts = (udid, remembered, started, recorded) => {
+  const ports = [
+    ...remembered !== null && (started.get(remembered) ?? udid) === udid ? [remembered] : [],
+    ...[...started].filter(([, device]) => device === udid).map(([port]) => port),
+    ...recorded.filter((entry) => entry.device === udid).map((entry) => entry.port)
+  ];
+  return [...new Set(ports)].filter((port) => (started.get(port) ?? udid) === udid);
 };
 var helperBase = (port, udid) => `http://${LOOPBACK}:${port}/helper/${encodeURIComponent(udid)}`;
 var probe = async (port, udid) => {
@@ -1409,55 +1418,76 @@ var portFree = (port) => new Promise((resolve) => {
 });
 var serveSimBinary = () => SERVE_SIM.find((candidate) => !candidate.startsWith("/") || existsSync2(candidate)) ?? "serve-sim";
 var sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-var starting = null;
-var ensureHelper = async (udid, preferred) => {
-  const candidates = [
-    ...preferred ? [preferred] : [],
-    ...portsFromStateFiles(),
-    ...Array.from({ length: PORT_SPAN }, (_, index) => FIRST_PORT + index)
-  ];
-  const seen = new Set;
-  for (const port of candidates) {
-    if (seen.has(port))
-      continue;
-    seen.add(port);
-    if (await probe(port, udid))
-      return port;
-  }
-  starting ??= startHelper(udid).finally(() => {
-    starting = null;
-  });
-  return starting;
-};
-var startHelper = async (udid) => {
-  let port = null;
-  for (let candidate = FIRST_PORT;candidate < FIRST_PORT + PORT_SPAN; candidate += 1) {
-    if (await portFree(candidate)) {
-      port = candidate;
-      break;
-    }
-  }
-  if (port === null)
-    throw new Error(`No free port ${FIRST_PORT}-${FIRST_PORT + PORT_SPAN - 1} for serve-sim`);
-  const log = openSync(join5(tmpdir4(), `openchamber-ios-simulator-serve-sim.log`), "a");
+var launchServeSim = (udid, port, onExit) => {
+  const log = openSync(join5(tmpdir4(), "openchamber-ios-simulator-serve-sim.log"), "a");
   const child = spawn(serveSimBinary(), [udid, "--port", String(port), "--host", LOOPBACK, "--exit-on-simulator-shutdown"], { detached: true, stdio: ["ignore", log, log], env: childEnv() });
   closeSync(log);
-  let exited = false;
-  child.once("exit", () => {
-    exited = true;
-  });
-  child.once("error", () => {
-    exited = true;
-  });
+  child.once("exit", onExit);
+  child.once("error", onExit);
   child.unref();
-  const deadline = Date.now() + 45000;
-  while (Date.now() < deadline && !exited) {
-    await sleep(500);
-    if (await probe(port, udid))
-      return port;
-  }
-  throw new Error("serve-sim did not start (log: $TMPDIR/openchamber-ios-simulator-serve-sim.log)");
 };
+var createHelpers = (deps) => {
+  const started = new Map;
+  const starting = new Map;
+  const reserved = new Set;
+  const startHelper = async (udid) => {
+    let port = null;
+    for (let candidate = FIRST_PORT;candidate < FIRST_PORT + PORT_SPAN; candidate += 1) {
+      if (reserved.has(candidate) || started.has(candidate))
+        continue;
+      reserved.add(candidate);
+      if (await deps.portFree(candidate)) {
+        port = candidate;
+        break;
+      }
+      reserved.delete(candidate);
+    }
+    if (port === null)
+      throw new Error(`No free port ${FIRST_PORT}-${FIRST_PORT + PORT_SPAN - 1} for serve-sim`);
+    try {
+      let exited = false;
+      deps.launch(udid, port, () => {
+        exited = true;
+        if (started.get(port) === udid)
+          started.delete(port);
+      });
+      const deadline = Date.now() + deps.startTimeoutMs;
+      while (Date.now() < deadline && !exited) {
+        await deps.sleep(250);
+        if (await deps.probe(port, udid)) {
+          started.set(port, udid);
+          return port;
+        }
+      }
+      throw new Error("serve-sim did not start (log: $TMPDIR/openchamber-ios-simulator-serve-sim.log)");
+    } finally {
+      reserved.delete(port);
+    }
+  };
+  return {
+    async ensure(udid, remembered) {
+      for (const port of candidatePorts(udid, remembered, started, deps.recorded())) {
+        if (await deps.probe(port, udid))
+          return port;
+      }
+      let pending = starting.get(udid);
+      if (!pending) {
+        pending = startHelper(udid).finally(() => starting.delete(udid));
+        starting.set(udid, pending);
+      }
+      return pending;
+    }
+  };
+};
+var helpers = createHelpers({
+  probe,
+  portFree,
+  recorded: () => helpersFromStateFiles(),
+  launch: launchServeSim,
+  sleep,
+  startTimeoutMs: 45000
+});
+var ensureHelper = (udid, remembered) => helpers.ensure(udid, remembered);
 
 // src/service/mjpeg.ts
 var SOI = Buffer.from([255, 216, 255]);
@@ -1586,7 +1616,7 @@ var solidPng = (width, height, rgb) => {
 // src/service/simulator.ts
 var VIEWER_GRACE_MS2 = 35000;
 var DEVICE_POLL_MS = 2000;
-var RECONNECT_MS = 1500;
+var RECONNECT_MS = 300;
 var APPEARANCE_TTL_MS = 15000;
 var MIN_TOUCH_MS = 40;
 var KEY_GAP_MS = 8;
@@ -1605,7 +1635,13 @@ var createSimulator = () => {
   let appearance = null;
   const layouts = new Map;
   let orientation = null;
-  let helperPort = null;
+  const helperPorts = new Map;
+  const helperFor = async (udid) => {
+    const port = await ensureHelper(udid, helperPorts.get(udid) ?? null);
+    helperPorts.set(udid, port);
+    return port;
+  };
+  let reconnectTimer = null;
   let lastViewerAt = 0;
   let framed = true;
   let quality = DEFAULT_QUALITY;
@@ -1666,8 +1702,8 @@ var createSimulator = () => {
     closeHid();
     hidUdid = udid;
     hidOpen = (async () => {
-      helperPort = await ensureHelper(udid, helperPort);
-      const socket = new WebSocket(`${helperBase(helperPort, udid).replace("http:", "ws:")}/ws`);
+      const port = await helperFor(udid);
+      const socket = new WebSocket(`${helperBase(port, udid).replace("http:", "ws:")}/ws`);
       socket.binaryType = "arraybuffer";
       socket.onmessage = (event) => {
         const bytes = new Uint8Array(event.data);
@@ -1684,6 +1720,7 @@ var createSimulator = () => {
         socket.onerror = () => reject(new Error("Could not open the HID connection to serve-sim"));
       });
       socket.onclose = () => {
+        helperPorts.delete(udid);
         if (hidSocket === socket)
           closeHid();
       };
@@ -1702,8 +1739,9 @@ var createSimulator = () => {
     streamUdid = device.udid;
     placeholderShown = false;
     const udid = device.udid;
+    let port;
     try {
-      helperPort = await ensureHelper(udid, helperPort);
+      port = await helperFor(udid);
     } catch (cause) {
       error = message(cause);
       if (streamUdid === udid)
@@ -1720,7 +1758,7 @@ var createSimulator = () => {
         return;
       hub.publish({ data: jpeg, mime: "image/jpeg", width: size.width, height: size.height, title: device.name });
     });
-    const request = http.get(`${helperBase(helperPort, udid)}/stream.mjpeg`, (response) => {
+    const request = http.get(`${helperBase(port, udid)}/stream.mjpeg`, (response) => {
       if (response.statusCode !== 200) {
         response.resume();
         request.destroy();
@@ -1736,6 +1774,16 @@ var createSimulator = () => {
       streamRequest = null;
       streamConnected = false;
       streamUdid = null;
+      helperPorts.delete(udid);
+      if (reconnectTimer)
+        clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        if (viewerPresent() && !streamRequest)
+          switchStream().catch(() => {
+            return;
+          });
+      }, RECONNECT_MS);
     });
     request.on("error", () => {
       return;
@@ -1869,8 +1917,10 @@ var createSimulator = () => {
       if (!device)
         throw new Error("Unknown device");
       selected = udid;
-      if (device.state !== "Booted")
+      if (device.state !== "Booted") {
         await runBusy("booting", () => bootDevice(udid));
+        helperPorts.delete(udid);
+      }
       await switchStream();
     },
     async shutdown() {
@@ -1882,6 +1932,7 @@ var createSimulator = () => {
         stopStream();
         closeHid();
         await shutdownDevice(device.udid);
+        helperPorts.delete(device.udid);
       });
     },
     async select(udid) {
@@ -1934,8 +1985,8 @@ var createSimulator = () => {
     },
     async axTree() {
       const device = await requireActive();
-      helperPort = await ensureHelper(device.udid, helperPort);
-      const response = await fetch(`${helperBase(helperPort, device.udid)}/ax`, { signal: AbortSignal.timeout(15000) });
+      const port = await helperFor(device.udid);
+      const response = await fetch(`${helperBase(port, device.udid)}/ax`, { signal: AbortSignal.timeout(15000) });
       if (!response.ok)
         throw new Error(`Accessibility tree unavailable (${response.status})`);
       return response.text();
@@ -1956,6 +2007,8 @@ var createSimulator = () => {
       controller = next;
     },
     stop() {
+      if (reconnectTimer)
+        clearTimeout(reconnectTimer);
       stopStream();
       closeHid();
     }

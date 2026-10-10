@@ -25,7 +25,8 @@ import {
 /** A viewer counts as present for this long after its last frame request. */
 const VIEWER_GRACE_MS = 35_000;
 const DEVICE_POLL_MS = 2_000;
-const RECONNECT_MS = 1_500;
+/** After the stream drops while someone watches, reconnect this soon (the device poll is the safety net). */
+const RECONNECT_MS = 300;
 const APPEARANCE_TTL_MS = 15_000;
 /** iOS sometimes drops a tap with no duration; the serve-sim CLI holds 40 ms. */
 const MIN_TOUCH_MS = 40;
@@ -48,7 +49,14 @@ export const createSimulator = () => {
   let appearance: { udid: string; value: Appearance; at: number } | null = null;
   const layouts = new Map<string, KeyboardLayout>();
   let orientation: Orientation | null = null;
-  let helperPort: number | null = null;
+  /** The loopback helper each device is reached through; only its own (see helper.ts). */
+  const helperPorts = new Map<string, number>();
+  const helperFor = async (udid: string): Promise<number> => {
+    const port = await ensureHelper(udid, helperPorts.get(udid) ?? null);
+    helperPorts.set(udid, port);
+    return port;
+  };
+  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   let lastViewerAt = 0;
   let framed = true;
   let quality: Quality = DEFAULT_QUALITY;
@@ -118,8 +126,8 @@ export const createSimulator = () => {
     closeHid();
     hidUdid = udid;
     hidOpen = (async () => {
-      helperPort = await ensureHelper(udid, helperPort);
-      const socket = new WebSocket(`${helperBase(helperPort, udid).replace('http:', 'ws:')}/ws`);
+      const port = await helperFor(udid);
+      const socket = new WebSocket(`${helperBase(port, udid).replace('http:', 'ws:')}/ws`);
       socket.binaryType = 'arraybuffer';
       socket.onmessage = (event) => {
         const bytes = new Uint8Array(event.data as ArrayBuffer);
@@ -136,6 +144,7 @@ export const createSimulator = () => {
         socket.onerror = () => reject(new Error('Could not open the HID connection to serve-sim'));
       });
       socket.onclose = () => {
+        helperPorts.delete(udid);
         if (hidSocket === socket) closeHid();
       };
       hidSocket = socket;
@@ -154,8 +163,9 @@ export const createSimulator = () => {
     streamUdid = device.udid;
     placeholderShown = false;
     const udid = device.udid;
+    let port: number;
     try {
-      helperPort = await ensureHelper(udid, helperPort);
+      port = await helperFor(udid);
     } catch (cause) {
       error = message(cause);
       if (streamUdid === udid) streamUdid = null;
@@ -168,7 +178,7 @@ export const createSimulator = () => {
       if (!size || streamUdid !== udid) return;
       hub.publish({ data: jpeg, mime: 'image/jpeg', width: size.width, height: size.height, title: device.name });
     });
-    const request = http.get(`${helperBase(helperPort, udid)}/stream.mjpeg`, (response) => {
+    const request = http.get(`${helperBase(port, udid)}/stream.mjpeg`, (response) => {
       if (response.statusCode !== 200) {
         response.resume();
         request.destroy();
@@ -182,7 +192,14 @@ export const createSimulator = () => {
       if (streamRequest !== request) return;
       streamRequest = null;
       streamConnected = false;
-      streamUdid = null; // the watcher reconnects
+      streamUdid = null;
+      // Its helper may be gone (it exits with its simulator): look it up again, and come back soon.
+      helperPorts.delete(udid);
+      if (reconnectTimer) clearTimeout(reconnectTimer);
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        if (viewerPresent() && !streamRequest) void switchStream().catch(() => undefined);
+      }, RECONNECT_MS);
     });
     request.on('error', () => undefined);
     streamRequest = request;
@@ -318,7 +335,10 @@ export const createSimulator = () => {
       const device = devices.find((candidate) => candidate.udid === udid);
       if (!device) throw new Error('Unknown device');
       selected = udid;
-      if (device.state !== 'Booted') await runBusy('booting', () => bootDevice(udid));
+      if (device.state !== 'Booted') {
+        await runBusy('booting', () => bootDevice(udid));
+        helperPorts.delete(udid); // a helper left from an earlier boot of this device is gone
+      }
       await switchStream();
     },
 
@@ -331,6 +351,7 @@ export const createSimulator = () => {
         stopStream();
         closeHid();
         await shutdownDevice(device.udid);
+        helperPorts.delete(device.udid); // its helper exits with it
       });
     },
 
@@ -396,8 +417,8 @@ export const createSimulator = () => {
 
     async axTree(): Promise<string> {
       const device = await requireActive();
-      helperPort = await ensureHelper(device.udid, helperPort);
-      const response = await fetch(`${helperBase(helperPort, device.udid)}/ax`, { signal: AbortSignal.timeout(15_000) });
+      const port = await helperFor(device.udid);
+      const response = await fetch(`${helperBase(port, device.udid)}/ax`, { signal: AbortSignal.timeout(15_000) });
       if (!response.ok) throw new Error(`Accessibility tree unavailable (${response.status})`);
       return response.text();
     },
@@ -421,6 +442,7 @@ export const createSimulator = () => {
     },
 
     stop() {
+      if (reconnectTimer) clearTimeout(reconnectTimer);
       stopStream();
       closeHid();
     },

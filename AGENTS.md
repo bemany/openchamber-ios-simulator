@@ -3,7 +3,7 @@
 - OpenChamber extension (manifest under `openchamber` in `package.json`). Read `node_modules/@openchamber/sdk/GUEST_SERVICES.md` (shared surface, services) before changing the service contract.
 - `src/service/`: Node service the host spawns (ESM bundle, loopback only). `src/panel/`: toolbar docked to the surface. `src/status/`: Work Status section. `src/frame/`: wiring shared by both frames. Frames are sandboxed iframes: classic IIFE bundles, no ESM.
 - Always `bun run check` (typecheck, tests, build) and commit `dist/` with the sources; the host never builds.
-- serve-sim is only ever bound to `127.0.0.1`. Never start or reuse a serve-sim preview server on another interface: it exposes a token-gated shell route.
+- serve-sim is only ever bound to `127.0.0.1`. Never start or reuse a serve-sim preview server on another interface: it exposes a token-gated shell route. Each device uses only its own helper (`createHelpers` in `helper.ts`); a helper exits with its simulator. Check with `scripts/gap.mjs` and `scripts/switch.mjs`.
 - Several simulators may run at once: picking a running device switches the stream, booting does not shut others down, power shuts down only the device shown.
 - Never boot a simulator unasked: picking a device that is off shows it as off (`shownDevice` in `simctl.ts`); only the toolbar's Boot button calls `POST /boot`.
 - Picture size (`Quality`: full/balanced/fast = divisor 1/2/3, default balanced) applies everywhere: `shrunkSize` is the one rounding rule, `loadChrome(type, divisor)` renders the frame at that size, the page draws and sends input at it. `present.ts` runs 2 to 4 workers (newest frame wins); shrunk pictures are encoded with MozJPEG, full size with jpeg-js.

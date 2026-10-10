@@ -9,7 +9,7 @@ After switching devices, or whenever another simulator shuts down, the picture c
 ## What Changes
 
 - The service streams a device only through a loopback helper that belongs to that device (its target device), and starts one for the device when none exists.
-- A helper reused from serve-sim's state files is matched by its recorded device; a helper of another device is used only as a fallback while the device's own helper starts.
+- A helper reused from serve-sim's state files is matched by its recorded device; a helper of another device is never used (a new helper answers in about 1.5 s, measured on 2026-10-10, so no fallback is needed).
 - After a boot, a shutdown or a device switch the service drops its remembered helper port, so it never reconnects to a helper that is exiting.
 - When the stream drops anyway, the service reconnects within about 2 seconds instead of waiting for the next device poll.
 

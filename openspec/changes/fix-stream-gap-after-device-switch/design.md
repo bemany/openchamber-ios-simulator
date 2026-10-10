@@ -16,7 +16,7 @@
 
 ## Decisions
 
-- **Owner by state file.** A helper's device is the `device` field of its state file (written by serve-sim for the helper it runs). Prefer the port whose state file names the device; accept a helper of another device only while the device's own helper starts. Alternative considered: `--no-exit` helpers shared by all devices; rejected because they would outlive their simulators and serve-sim offers no clean shared mode.
+- **Owner by state file.** A helper's device is the `device` field of its state file (written by serve-sim for the helper it runs), or the device the service started it for. Only a helper owned by the device is used; otherwise one is started. No fallback to another device's helper: a new helper answered `/health` after 1.5 s in a measurement on 2026-10-10, well inside the 5 s budget. Alternative considered: `--no-exit` helpers shared by all devices; rejected because they would outlive their simulators and serve-sim offers no clean shared mode.
 - **Remember the helper per device** (`Map<udid, port>`) instead of one `helperPort`, and drop a device's entry when its stream or HID socket closes.
 - **Immediate reconnect.** On a stream close while a viewer is present, schedule a reconnect after 1 s instead of waiting for the next poll; keep the poll as the safety net.
 - **Spawn per device.** `startHelper` already serializes starts; make it per device so two devices can start helpers in parallel without sharing one promise.
@@ -25,4 +25,3 @@
 
 - [More serve-sim processes, one per viewed device] → They exit with their simulator; only viewed devices get one.
 - [State files can be stale or rewritten by other serve-sim runs] → Still probe `/health` before use; a stale entry falls back to starting a helper.
-- [A helper of another device in use during startup] → Switch to the device's own helper as soon as it answers; verify with the switch scenario.

@@ -4,7 +4,7 @@ An [OpenChamber](https://openchamber.dev) extension that shows the iOS Simulator
 
 - **Panel + page**: a rail panel with a toolbar docked above the picture, and a larger full-screen page (OpenChamber > *Extension pages*). A Work Status section says which device runs and whether the stream is on.
 - **Works everywhere OpenChamber does**: the picture travels through OpenChamber's shared surface, so the desktop app, a browser and the relay to a phone all see it, with no extra port.
-- **Local only**: serve-sim is only ever bound to `127.0.0.1`. No accounts, no telemetry.
+- **Local only**: serve-sim is only ever bound to `127.0.0.1`, one helper per device shown. No accounts, no telemetry.
 
 ![The rail panel: toolbar, iPhone in its device frame, Work Status section below](docs/panel.png)
 
@@ -79,6 +79,8 @@ bun install
 bun run check                       # tsc --noEmit, bun test, build into dist/
 node scripts/smoke.mjs              # start the built service like OpenChamber and read a real frame
 node scripts/bench.mjs              # frames per second and size per mode (turns the device shown)
+node scripts/gap.mjs                # longest picture pause when a helper dies or another simulator shuts down
+node scripts/switch.mjs             # time to switch between two running devices (SWITCH_A, SWITCH_B)
 bun run preview                     # stand-in host on http://127.0.0.1:4790/<random>/, page at <random>/page
 ```
 
@@ -129,7 +131,7 @@ All behind the host's token, on `127.0.0.1`:
 ## Security boundary
 
 - The service listens on `127.0.0.1` only and answers nothing without OpenChamber's bearer token. The panel and page never see that token; they reach the service only through `host.serviceRequest()`.
-- serve-sim is only ever bound to `127.0.0.1`. The service reuses a serve-sim server already listening on loopback, or starts `serve-sim <udid> --port 31xx --host 127.0.0.1 --exit-on-simulator-shutdown`. It never starts, reuses or touches a serve-sim preview server on another interface: that server's page carries a token for a shell route, so anyone who can load the page can run commands on the machine.
+- serve-sim is only ever bound to `127.0.0.1`. Each device is reached through its own helper (it exits with its simulator, so other simulators shutting down never cut the picture): the service reuses the device's helper recorded on loopback, or starts `serve-sim <udid> --port 31xx --host 127.0.0.1 --exit-on-simulator-shutdown`. It never starts, reuses or touches a serve-sim preview server on another interface: that server's page carries a token for a shell route, so anyone who can load the page can run commands on the machine.
 - **Open in serve-sim** is opt-in. It only opens an address you stored yourself (kept in OpenChamber's instance storage for this extension, never in the repository) through `host.openUrl`, in a tab outside OpenChamber. Use it only for an address in your own network, such as your tailnet; it does not work over the relay. Embedding serve-sim inside the page is not possible: OpenChamber's page policy allows frames, images and connections only from the extension's own files (and approved https origins), which keeps third-party pages from reaching your network.
 - The device frame is rendered from the Xcode on the machine at runtime; no Apple artwork is in this repository.
 
