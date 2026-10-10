@@ -15,4 +15,4 @@
 
 - [x] 3.1 With two running simulators, view one and shut down the other: the picture keeps updating (no "No stream"); record the result in the issue
 - [x] 3.2 Switch between two running devices five times and confirm "Live" within 5 s each time
-- [ ] 3.3 `bun run check` and `node scripts/smoke.mjs` green, `dist/` committed, issue #2 closed with the commit
+- [x] 3.3 `bun run check` and `node scripts/smoke.mjs` green, `dist/` committed, issue #2 closed with the commit
