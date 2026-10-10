@@ -1,6 +1,6 @@
 {
   "name": "openchamber-ios-simulator",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "OpenChamber extension that shows the iOS Simulator live in a panel and lets you use it (built on serve-sim).",
   "license": "MIT",
   "private": true,

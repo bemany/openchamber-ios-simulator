@@ -327,6 +327,10 @@ const routes: Record<string, Route> = {
     await sim.rotate(ORIENTATIONS.find((value) => value === body.orientation));
     send(res, 200, await sim.state());
   },
+  'POST /repair-input': async (_req, res) => {
+    await sim.repairInput();
+    send(res, 200, await sim.state());
+  },
   'POST /appearance': async (req, res) => {
     const body = await readJson(req);
     await sim.setAppearance(body.mode === 'light' || body.mode === 'dark' ? body.mode : undefined);

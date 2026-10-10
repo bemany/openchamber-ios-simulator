@@ -18,6 +18,7 @@ select:focus-visible,.ib:focus-visible{outline:2px solid var(--oc-focus);outline
 .ib.on{color:var(--oc-success-text)}
 .ib[aria-pressed="true"]{background:var(--oc-active)}
 .ib.pending{opacity:.6;cursor:progress}
+.ib.armed{color:var(--oc-warning-text);background:var(--oc-hover)}
 .ib.q{width:auto;padding:0 6px;font-size:11px;font-variant-numeric:tabular-nums}
 .sep{width:1px;height:18px;background:var(--oc-border);margin:0 2px;flex:none}
 .grow{flex:1;min-width:4px}
@@ -33,6 +34,8 @@ select:focus-visible,.ib:focus-visible{outline:2px solid var(--oc-focus);outline
 const DEVICE_KEY = 'device';
 const FRAMED_KEY = 'framed';
 const QUALITY_KEY = 'quality';
+/** How long the repair button waits for its second click. */
+const REPAIR_ARMED_MS = 4_000;
 const QUALITY_LABEL: Record<Quality, string> = { full: '1:1', balanced: '1:2', fast: '1:3' };
 const nextQuality = (quality: Quality): Quality => QUALITIES[(QUALITIES.indexOf(quality) + 1) % QUALITIES.length]!;
 
@@ -60,6 +63,9 @@ export const createToolbar = (bar: HTMLElement, host: () => HostClient, options:
   const rotate = iconButton('rotate');
   const appearance = iconButton('contrast');
   const lock = iconButton('lock');
+  /** Repairs touch input; closes the device's apps, so it needs a second click. */
+  const repair = iconButton('wrench');
+  let repairArmed: ReturnType<typeof setTimeout> | null = null;
   const frame = iconButton('frame');
   /** serve-sim's own interface in a tab of its own, at the address the user stored. */
   const open = iconButton('external');
@@ -75,7 +81,7 @@ export const createToolbar = (bar: HTMLElement, host: () => HostClient, options:
   const boot = element('button', 'boot');
   boot.type = 'button';
   boot.hidden = true;
-  bar.append(select, power, element('span', 'sep'), home, rotate, appearance, lock, element('span', 'sep'), frame, quality, open, element('span', 'grow'), status, boot);
+  bar.append(select, power, repair, element('span', 'sep'), home, rotate, appearance, lock, element('span', 'sep'), frame, quality, open, element('span', 'grow'), status, boot);
 
   let context: FrameContext | null = null;
   let shownOptions = '';
@@ -109,6 +115,21 @@ export const createToolbar = (bar: HTMLElement, host: () => HostClient, options:
   lock.addEventListener('click', () => void context?.act('/button', { name: 'lock' }));
   rotate.addEventListener('click', () => void context?.act('/rotate'));
   appearance.addEventListener('click', () => void context?.act('/appearance'));
+  repair.addEventListener('click', () => {
+    if (!context) return;
+    if (repairArmed) {
+      clearTimeout(repairArmed);
+      repairArmed = null;
+      void context.act('/repair-input');
+      return;
+    }
+    // First click only arms; no confirm() in a sandboxed frame.
+    repairArmed = setTimeout(() => {
+      repairArmed = null;
+      if (context) render(context);
+    }, REPAIR_ARMED_MS);
+    render(context);
+  });
   open.addEventListener('click', () => {
     if (directUrl) {
       void host().openUrl(directUrl).catch(() => undefined);
@@ -207,7 +228,7 @@ export const createToolbar = (bar: HTMLElement, host: () => HostClient, options:
     if (view.kind !== 'ready') {
       boot.hidden = true;
       status.hidden = false;
-      for (const control of [select, power, home, rotate, appearance, lock, frame, quality]) control.disabled = true;
+      for (const control of [select, power, repair, home, rotate, appearance, lock, frame, quality]) control.disabled = true;
       if (view.kind === 'loading') setStatus('', t.loading);
       else {
         const text = view.reason === 'not-granted' ? t.notGranted : view.reason === 'disabled' ? t.disabled : t.failed;
@@ -245,6 +266,14 @@ export const createToolbar = (bar: HTMLElement, host: () => HostClient, options:
     power.classList.toggle('pending', pending === '/boot' || pending === '/shutdown');
     label(power, live ? t.stop : t.start);
     for (const control of [home, rotate, appearance, lock]) control.disabled = !live || busy;
+    repair.disabled = !live || busy;
+    if (repair.disabled && repairArmed) {
+      clearTimeout(repairArmed);
+      repairArmed = null;
+    }
+    repair.classList.toggle('armed', repairArmed !== null);
+    repair.classList.toggle('pending', state.busy === 'repairing');
+    label(repair, repairArmed ? t.repairConfirm : t.repair);
     label(appearance, state.appearance === 'dark' ? t.appearanceToLight : t.appearanceToDark);
     frame.disabled = pending === '/frame';
     frame.setAttribute('aria-pressed', String(state.framed));
@@ -257,6 +286,8 @@ export const createToolbar = (bar: HTMLElement, host: () => HostClient, options:
     if (state.devices.length === 0) setStatus('error', t.noDevices);
     else if (state.busy === 'booting') setStatus('busy', t.booting);
     else if (state.busy === 'shutting-down') setStatus('busy', t.shuttingDown);
+    else if (state.busy === 'repairing') setStatus('busy', t.repairing);
+    else if (repairArmed && live) setStatus('busy', t.repairConfirm);
     else if (!live) {
       const chosen = state.devices.find((device) => device.udid === state.selected);
       const text = chosen ? t.deviceOff(chosen.name) : t.noDevice;

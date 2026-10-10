@@ -1420,6 +1420,7 @@ import { join as join5 } from "node:path";
 var LOOPBACK = "127.0.0.1";
 var FIRST_PORT = 3100;
 var PORT_SPAN = 10;
+var STOP_TIMEOUT_MS = 3000;
 var isLoopbackUrl = (url) => {
   try {
     const host = new URL(url).hostname;
@@ -1441,7 +1442,7 @@ var helpersFromStateFiles = (dir = join5(tmpdir4(), "serve-sim")) => {
       const state = JSON.parse(readFileSync2(join5(dir, name), "utf8"));
       if (typeof state.url !== "string" || !isLoopbackUrl(state.url) || typeof state.port !== "number" || typeof state.device !== "string")
         continue;
-      helpers.push({ port: state.port, device: state.device });
+      helpers.push({ port: state.port, device: state.device, ...typeof state.pid === "number" ? { pid: state.pid } : {} });
     } catch {}
   }
   return helpers;
@@ -1480,9 +1481,11 @@ var launchServeSim = (udid, port, onExit) => {
   child.once("exit", onExit);
   child.once("error", onExit);
   child.unref();
+  return child.pid;
 };
 var createHelpers = (deps) => {
   const started = new Map;
+  const pids = new Map;
   const starting = new Map;
   const reserved = new Set;
   const startHelper = async (udid) => {
@@ -1501,11 +1504,15 @@ var createHelpers = (deps) => {
       throw new Error(`No free port ${FIRST_PORT}-${FIRST_PORT + PORT_SPAN - 1} for serve-sim`);
     try {
       let exited = false;
-      deps.launch(udid, port, () => {
+      const pid = deps.launch(udid, port, () => {
         exited = true;
-        if (started.get(port) === udid)
+        if (started.get(port) === udid) {
           started.delete(port);
+          pids.delete(port);
+        }
       });
+      if (pid !== undefined)
+        pids.set(port, pid);
       const deadline = Date.now() + deps.startTimeoutMs;
       while (Date.now() < deadline && !exited) {
         await deps.sleep(250);
@@ -1519,30 +1526,65 @@ var createHelpers = (deps) => {
       reserved.delete(port);
     }
   };
-  return {
-    async ensure(udid, remembered) {
-      for (const port of candidatePorts(udid, remembered, started, deps.recorded())) {
-        if (await deps.probe(port, udid))
-          return port;
-      }
-      let pending = starting.get(udid);
-      if (!pending) {
-        pending = startHelper(udid).finally(() => starting.delete(udid));
-        starting.set(udid, pending);
-      }
-      return pending;
+  const ensure = async (udid, remembered) => {
+    for (const port of candidatePorts(udid, remembered, started, deps.recorded())) {
+      if (await deps.probe(port, udid))
+        return port;
     }
+    let pending = starting.get(udid);
+    if (!pending) {
+      pending = startHelper(udid).finally(() => starting.delete(udid));
+      starting.set(udid, pending);
+    }
+    return pending;
   };
+  const restart = async (udid) => {
+    await starting.get(udid)?.catch(() => {
+      return;
+    });
+    const targets = new Map;
+    for (const [port, device] of started)
+      if (device === udid)
+        targets.set(port, pids.get(port));
+    for (const entry of deps.recorded()) {
+      if (entry.device !== udid || entry.pid === undefined || (started.get(entry.port) ?? udid) !== udid)
+        continue;
+      if (targets.get(entry.port) === undefined && await deps.probe(entry.port, udid))
+        targets.set(entry.port, entry.pid);
+    }
+    for (const [port, pid] of targets) {
+      if (pid !== undefined)
+        deps.kill(pid);
+      started.delete(port);
+      pids.delete(port);
+    }
+    const deadline = Date.now() + STOP_TIMEOUT_MS;
+    for (const port of targets.keys()) {
+      while (await deps.probe(port, udid)) {
+        if (Date.now() > deadline)
+          throw new Error(`The serve-sim helper on port ${port} did not stop`);
+        await deps.sleep(100);
+      }
+    }
+    return ensure(udid, null);
+  };
+  return { ensure, restart };
 };
 var helpers = createHelpers({
   probe,
   portFree,
   recorded: () => helpersFromStateFiles(),
   launch: launchServeSim,
+  kill: (pid) => {
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch {}
+  },
   sleep,
   startTimeoutMs: 45000
 });
 var ensureHelper = (udid, remembered) => helpers.ensure(udid, remembered);
+var restartHelper = (udid) => helpers.restart(udid);
 
 // src/service/mjpeg.ts
 var SOI = Buffer.from([255, 216, 255]);
@@ -1666,6 +1708,19 @@ var solidPng = (width, height, rgb) => {
     chunk2("IDAT", deflateSync2(raw)),
     chunk2("IEND", Buffer.alloc(0))
   ]);
+};
+
+// src/service/repair.ts
+var repairInput = async (udid, deps) => {
+  const result = await deps.serveSim(["repair-input", "-d", udid]);
+  if (!result.ok) {
+    if (result.missing)
+      throw new Error("serve-sim not found (npm install -g serve-sim)");
+    const reason = result.stderr.trim().split(`
+`).find((line) => line.trim()) ?? "unknown error";
+    throw new Error(`serve-sim repair-input failed: ${reason}`);
+  }
+  return deps.restartHelper(udid);
 };
 
 // src/service/simulator.ts
@@ -1924,7 +1979,7 @@ var createSimulator = () => {
   };
   const runBusy = async (kind, work) => {
     if (busy)
-      throw new Error("Another boot or shutdown is in progress");
+      throw new Error("Another boot, shutdown or repair is in progress");
     busy = kind;
     error = null;
     try {
@@ -1992,6 +2047,22 @@ var createSimulator = () => {
         await shutdownDevice(device.udid);
         helperPorts.delete(device.udid);
       });
+    },
+    async repairInput() {
+      const device = await requireActive();
+      await runBusy("repairing", async () => {
+        const port = await repairInput(device.udid, {
+          serveSim: (args) => run(SERVE_SIM, args, { timeout: 120000 }),
+          restartHelper: async (udid) => {
+            stopStream();
+            closeHid();
+            helperPorts.delete(udid);
+            return restartHelper(udid);
+          }
+        });
+        helperPorts.set(device.udid, port);
+      });
+      await switchStream();
     },
     async select(udid) {
       await refreshDevices();
@@ -2364,6 +2435,10 @@ var routes = {
   "POST /rotate": async (req, res) => {
     const body = await readJson(req);
     await sim.rotate(ORIENTATIONS.find((value) => value === body.orientation));
+    send(res, 200, await sim.state());
+  },
+  "POST /repair-input": async (_req, res) => {
+    await sim.repairInput();
     send(res, 200, await sim.state());
   },
   "POST /appearance": async (req, res) => {

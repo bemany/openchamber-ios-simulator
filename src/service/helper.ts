@@ -16,6 +16,8 @@ import { childEnv, SERVE_SIM } from './exec.ts';
 export const LOOPBACK = '127.0.0.1';
 const FIRST_PORT = 3100;
 const PORT_SPAN = 10;
+/** How long stopped helpers may take to close their port. */
+const STOP_TIMEOUT_MS = 3_000;
 
 const isLoopbackUrl = (url: string): boolean => {
   try {
@@ -26,7 +28,7 @@ const isLoopbackUrl = (url: string): boolean => {
   }
 };
 
-export type HelperEntry = { port: number; device: string };
+export type HelperEntry = { port: number; device: string; pid?: number };
 
 /** Helpers recorded in serve-sim's state files: port and the device each belongs to, loopback only. */
 export const helpersFromStateFiles = (dir = join(tmpdir(), 'serve-sim')): HelperEntry[] => {
@@ -39,9 +41,9 @@ export const helpersFromStateFiles = (dir = join(tmpdir(), 'serve-sim')): Helper
   }
   for (const name of names) {
     try {
-      const state = JSON.parse(readFileSync(join(dir, name), 'utf8')) as { url?: string; port?: number; device?: string };
+      const state = JSON.parse(readFileSync(join(dir, name), 'utf8')) as { url?: string; port?: number; device?: string; pid?: number };
       if (typeof state.url !== 'string' || !isLoopbackUrl(state.url) || typeof state.port !== 'number' || typeof state.device !== 'string') continue;
-      helpers.push({ port: state.port, device: state.device });
+      helpers.push({ port: state.port, device: state.device, ...(typeof state.pid === 'number' ? { pid: state.pid } : {}) });
     } catch {
       // broken or half-written file: skip it
     }
@@ -94,8 +96,10 @@ export type HelperDeps = {
   probe: (port: number, udid: string) => Promise<boolean>;
   portFree: (port: number) => Promise<boolean>;
   recorded: () => HelperEntry[];
-  /** Starts `serve-sim <udid>` on `port`; `onExit` runs when that process ends. */
-  launch: (udid: string, port: number, onExit: () => void) => void;
+  /** Starts `serve-sim <udid>` on `port`; `onExit` runs when that process ends. Answers its pid. */
+  launch: (udid: string, port: number, onExit: () => void) => number | undefined;
+  /** Asks a helper process to end. */
+  kill: (pid: number) => void;
   sleep: (ms: number) => Promise<void>;
   /** How long a start may take before it counts as failed. */
   startTimeoutMs: number;
@@ -113,11 +117,13 @@ const launchServeSim: HelperDeps['launch'] = (udid, port, onExit) => {
   child.once('exit', onExit);
   child.once('error', onExit);
   child.unref();
+  return child.pid;
 };
 
 export const createHelpers = (deps: HelperDeps) => {
-  /** Helpers this service started: port to device. */
+  /** Helpers this service started: port to device, and port to process. */
   const started = new Map<number, string>();
+  const pids = new Map<number, number>();
   /** One pending start per device; devices start in parallel. */
   const starting = new Map<string, Promise<number>>();
   /** Ports picked by a start that has not answered yet, so two starts never pick the same one. */
@@ -138,10 +144,14 @@ export const createHelpers = (deps: HelperDeps) => {
     if (port === null) throw new Error(`No free port ${FIRST_PORT}-${FIRST_PORT + PORT_SPAN - 1} for serve-sim`);
     try {
       let exited = false;
-      deps.launch(udid, port, () => {
+      const pid = deps.launch(udid, port, () => {
         exited = true;
-        if (started.get(port) === udid) started.delete(port);
+        if (started.get(port) === udid) {
+          started.delete(port);
+          pids.delete(port);
+        }
       });
+      if (pid !== undefined) pids.set(port, pid);
       const deadline = Date.now() + deps.startTimeoutMs;
       while (Date.now() < deadline && !exited) {
         await deps.sleep(250);
@@ -156,20 +166,50 @@ export const createHelpers = (deps: HelperDeps) => {
     }
   };
 
-  return {
-    /** Port of the loopback helper that belongs to `udid`. Starts one when none runs. */
-    async ensure(udid: string, remembered: number | null): Promise<number> {
-      for (const port of candidatePorts(udid, remembered, started, deps.recorded())) {
-        if (await deps.probe(port, udid)) return port;
-      }
-      let pending = starting.get(udid);
-      if (!pending) {
-        pending = startHelper(udid).finally(() => starting.delete(udid));
-        starting.set(udid, pending);
-      }
-      return pending;
-    },
+  /** Port of the loopback helper that belongs to `udid`. Starts one when none runs. */
+  const ensure = async (udid: string, remembered: number | null): Promise<number> => {
+    for (const port of candidatePorts(udid, remembered, started, deps.recorded())) {
+      if (await deps.probe(port, udid)) return port;
+    }
+    let pending = starting.get(udid);
+    if (!pending) {
+      pending = startHelper(udid).finally(() => starting.delete(udid));
+      starting.set(udid, pending);
+    }
+    return pending;
   };
+
+  /**
+   * Stops the loopback helpers of `udid` (the ones this service started, and the
+   * one serve-sim recorded for it while it answers for that device) and starts
+   * one fresh helper, as serve-sim asks after `repair-input`. Other devices'
+   * helpers and servers on other interfaces are left alone.
+   */
+  const restart = async (udid: string): Promise<number> => {
+    await starting.get(udid)?.catch(() => undefined);
+    const targets = new Map<number, number | undefined>();
+    for (const [port, device] of started) if (device === udid) targets.set(port, pids.get(port));
+    for (const entry of deps.recorded()) {
+      if (entry.device !== udid || entry.pid === undefined || (started.get(entry.port) ?? udid) !== udid) continue;
+      // A recorded pid counts only while its port still answers for this device (pids get reused).
+      if (targets.get(entry.port) === undefined && (await deps.probe(entry.port, udid))) targets.set(entry.port, entry.pid);
+    }
+    for (const [port, pid] of targets) {
+      if (pid !== undefined) deps.kill(pid);
+      started.delete(port);
+      pids.delete(port);
+    }
+    const deadline = Date.now() + STOP_TIMEOUT_MS;
+    for (const port of targets.keys()) {
+      while (await deps.probe(port, udid)) {
+        if (Date.now() > deadline) throw new Error(`The serve-sim helper on port ${port} did not stop`);
+        await deps.sleep(100);
+      }
+    }
+    return ensure(udid, null);
+  };
+
+  return { ensure, restart };
 };
 
 const helpers = createHelpers({
@@ -177,9 +217,19 @@ const helpers = createHelpers({
   portFree,
   recorded: () => helpersFromStateFiles(),
   launch: launchServeSim,
+  kill: (pid) => {
+    try {
+      process.kill(pid, 'SIGTERM');
+    } catch {
+      // already gone
+    }
+  },
   sleep,
   startTimeoutMs: 45_000,
 });
 
 /** Port of the loopback helper that belongs to `udid`. Starts one when none runs. */
 export const ensureHelper = (udid: string, remembered: number | null): Promise<number> => helpers.ensure(udid, remembered);
+
+/** Stops the loopback helpers of `udid` and starts one fresh helper; answers its port. */
+export const restartHelper = (udid: string): Promise<number> => helpers.restart(udid);

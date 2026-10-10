@@ -6,11 +6,13 @@
 import http from 'node:http';
 
 import { DEFAULT_QUALITY, type Appearance, type Busy, type Device, type KeyboardLayout, type Orientation, type Quality, type SimState } from '../shared/state.ts';
+import { run, SERVE_SIM } from './exec.ts';
 import { createFrameHub, type Frame } from './frames.ts';
-import { ensureHelper, helperBase } from './helper.ts';
+import { ensureHelper, helperBase, restartHelper } from './helper.ts';
 import { encodeHid, encodeMessage, OPCODE, type HidMessage } from './input.ts';
 import { createMjpegParser, jpegSize } from './mjpeg.ts';
 import { solidPng } from './placeholder.ts';
+import { repairInput } from './repair.ts';
 import {
   bootDevice,
   defaultDevice,
@@ -285,7 +287,7 @@ export const createSimulator = () => {
   };
 
   const runBusy = async (kind: Exclude<Busy, null>, work: () => Promise<void>) => {
-    if (busy) throw new Error('Another boot or shutdown is in progress');
+    if (busy) throw new Error('Another boot, shutdown or repair is in progress');
     busy = kind;
     error = null;
     try {
@@ -357,6 +359,24 @@ export const createSimulator = () => {
         await shutdownDevice(device.udid);
         helperPorts.delete(device.udid); // its helper exits with it
       });
+    },
+
+    /** Repairs the shown device's input (closes its running apps) and reconnects through a fresh helper. */
+    async repairInput() {
+      const device = await requireActive();
+      await runBusy('repairing', async () => {
+        const port = await repairInput(device.udid, {
+          serveSim: (args) => run(SERVE_SIM, args, { timeout: 120_000 }),
+          restartHelper: async (udid) => {
+            stopStream();
+            closeHid();
+            helperPorts.delete(udid);
+            return restartHelper(udid);
+          },
+        });
+        helperPorts.set(device.udid, port);
+      });
+      await switchStream();
     },
 
     /** The toolbar's choice: shown at once when it runs; when it is off, shown as off until someone boots it. */

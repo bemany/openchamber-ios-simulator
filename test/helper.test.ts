@@ -3,7 +3,7 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { candidatePorts, createHelpers, helpersFromStateFiles, type HelperDeps } from '../src/service/helper.ts';
+import { candidatePorts, createHelpers, helpersFromStateFiles, type HelperDeps, type HelperEntry } from '../src/service/helper.ts';
 
 const state = (port: number, device: string, host = '127.0.0.1') => ({
   pid: 1,
@@ -19,7 +19,7 @@ describe('helper ownership', () => {
     writeFileSync(join(dir, 'server-B.json'), JSON.stringify(state(3200, 'B', '192.0.2.10')));
     writeFileSync(join(dir, 'server-C.json'), '{ half written');
     writeFileSync(join(dir, 'server-A.log'), 'not json');
-    expect(helpersFromStateFiles(dir)).toEqual([{ port: 3100, device: 'A' }]);
+    expect(helpersFromStateFiles(dir)).toEqual([{ port: 3100, device: 'A', pid: 1 }]);
   });
 
   test('only the device\'s own helpers are candidates', () => {
@@ -38,22 +38,37 @@ describe('helper ownership', () => {
 });
 
 describe('helper starts', () => {
-  /** A fake world: launching makes the helper answer after `delay` ms. */
-  const world = (delay: number) => {
+  /** A fake world: launching makes the helper answer after `delay` ms; killing a pid silences its port. */
+  const world = (delay: number, recorded: HelperEntry[] = []) => {
     const answering = new Map<number, string>();
+    const owners = new Map<number, number>(); // pid -> port
+    for (const entry of recorded) {
+      answering.set(entry.port, entry.device);
+      if (entry.pid !== undefined) owners.set(entry.pid, entry.port);
+    }
     const launched: Array<{ udid: string; port: number }> = [];
+    const killed: number[] = [];
+    let nextPid = 100;
     const deps: HelperDeps = {
       probe: async (port, udid) => answering.get(port) === udid,
       portFree: async (port) => !answering.has(port) && port !== 3100,
-      recorded: () => [],
+      recorded: () => recorded,
       launch: (udid, port) => {
         launched.push({ udid, port });
         setTimeout(() => answering.set(port, udid), delay);
+        nextPid += 1;
+        owners.set(nextPid, port);
+        return nextPid;
+      },
+      kill: (pid) => {
+        killed.push(pid);
+        const port = owners.get(pid);
+        if (port !== undefined) answering.delete(port);
       },
       sleep: (ms) => new Promise((resolve) => setTimeout(resolve, Math.min(ms, 5))),
       startTimeoutMs: 1_000,
     };
-    return { deps, launched };
+    return { deps, launched, killed, answering };
   };
 
   test('two devices start helpers in parallel on different ports', async () => {
@@ -78,5 +93,70 @@ describe('helper starts', () => {
     const { deps } = world(10_000);
     const helpers = createHelpers({ ...deps, startTimeoutMs: 50 });
     await expect(helpers.ensure('PHONE', null)).rejects.toThrow('serve-sim did not start');
+  });
+});
+
+describe('helper restart after repair-input', () => {
+  const world = (recorded: HelperEntry[]) => {
+    const answering = new Map<number, string>(recorded.map((entry) => [entry.port, entry.device]));
+    const owners = new Map<number, number>(recorded.flatMap((entry) => (entry.pid === undefined ? [] : [[entry.pid, entry.port] as [number, number]])));
+    const killed: number[] = [];
+    let nextPid = 100;
+    const deps: HelperDeps = {
+      probe: async (port, udid) => answering.get(port) === udid,
+      portFree: async (port) => !answering.has(port),
+      recorded: () => recorded.filter((entry) => answering.has(entry.port)),
+      launch: (udid, port) => {
+        answering.set(port, udid);
+        nextPid += 1;
+        owners.set(nextPid, port);
+        return nextPid;
+      },
+      kill: (pid) => {
+        killed.push(pid);
+        const port = owners.get(pid);
+        if (port !== undefined) answering.delete(port);
+      },
+      sleep: (ms) => new Promise((resolve) => setTimeout(resolve, Math.min(ms, 5))),
+      startTimeoutMs: 1_000,
+    };
+    return { deps, killed, answering };
+  };
+
+  test('stops the device\'s own and recorded helpers, leaves other devices alone, ends with one helper', async () => {
+    const { deps, killed, answering } = world([
+      { port: 3100, device: 'NODUS', pid: 10 },
+      { port: 3101, device: 'PHONE', pid: 11 },
+    ]);
+    const helpers = createHelpers(deps);
+    expect(await helpers.ensure('PHONE', null)).toBe(3101);
+    const fresh = await helpers.restart('PHONE');
+    expect(killed).toEqual([11]);
+    expect(answering.get(3100)).toBe('NODUS');
+    expect([...answering].filter(([, device]) => device === 'PHONE').map(([port]) => port)).toEqual([fresh]);
+  });
+
+  test('a helper this service started is stopped by its own pid', async () => {
+    const { deps, killed } = world([]);
+    const helpers = createHelpers(deps);
+    const first = await helpers.ensure('PHONE', null);
+    const second = await helpers.restart('PHONE');
+    expect(killed).toEqual([101]);
+    expect(second).toBe(first); // the freed port is taken again
+    expect(await helpers.ensure('PHONE', null)).toBe(second);
+  });
+
+  test('a recorded pid whose port answers for another device is not touched', async () => {
+    const { deps, killed } = world([{ port: 3101, device: 'PHONE', pid: 11 }]);
+    deps.probe = async () => false; // the port no longer answers for PHONE: pid 11 may be someone else now
+    const helpers = createHelpers({ ...deps, startTimeoutMs: 30 });
+    await expect(helpers.restart('PHONE')).rejects.toThrow('serve-sim did not start');
+    expect(killed).toEqual([]);
+  });
+
+  test('a helper that does not stop fails the restart', async () => {
+    const { deps } = world([{ port: 3101, device: 'PHONE', pid: 11 }]);
+    const helpers = createHelpers({ ...deps, kill: () => undefined });
+    await expect(helpers.restart('PHONE')).rejects.toThrow('did not stop');
   });
 });

@@ -19,7 +19,7 @@ export type Appearance = 'light' | 'dark' | 'unknown';
 /** Hardware keyboard layouts the service can type in; anything else is typed as `us`. */
 export type KeyboardLayout = 'ch' | 'de' | 'es' | 'fr' | 'gb' | 'it' | 'us';
 
-export type Busy = 'booting' | 'shutting-down' | null;
+export type Busy = 'booting' | 'shutting-down' | 'repairing' | null;
 
 /** Picture size: full framebuffer, half or a third per side. Smaller is smoother over the network. */
 export type Quality = 'full' | 'balanced' | 'fast';

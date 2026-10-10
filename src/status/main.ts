@@ -52,6 +52,8 @@ const host = startFrame(({ view, t }) => {
     ? row(t.device, t.booting, 'busy')
     : state.busy === 'shutting-down'
       ? row(t.device, t.shuttingDown, 'busy')
+      : state.busy === 'repairing'
+        ? row(t.device, t.repairing, 'busy')
       : state.active
         ? row(t.device, `${state.active.name} (${state.active.runtime})`, 'on')
         : row(t.device, offText(state, t), '');
