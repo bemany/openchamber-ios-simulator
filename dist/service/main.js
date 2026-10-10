@@ -574,15 +574,21 @@ var pressSequence = (stroke, extra = {}) => {
 var typeText = (text, layout = "us") => {
   const events = [];
   let skipped = 0;
-  for (const char of text.replace(/\r\n?/g, `
-`)) {
+  const chars = [...text.replace(/\r\n?/g, `
+`)];
+  let typed = "";
+  for (let index = 0;index < chars.length; index += 1) {
+    const char = chars[index];
     const sequence = sequenceForChar(char, layout);
     if (!sequence) {
       skipped += 1;
+      if (typed === " " && chars[index + 1] === " ")
+        index += 1;
       continue;
     }
     for (const stroke of sequence)
       events.push(...pressSequence(stroke));
+    typed = char;
   }
   return { events, skipped };
 };
@@ -606,7 +612,8 @@ var parseDevices = (json) => {
     for (const device of parsed.devices?.[runtime] ?? []) {
       if (!device.udid || !device.name || device.isAvailable === false)
         continue;
-      if (!/^(iPhone|iPad)\b/.test(device.name))
+      const type = device.deviceTypeIdentifier ?? "";
+      if (type ? !/SimDeviceType\.(iPhone|iPad)/.test(type) : !/^(iPhone|iPad)\b/.test(device.name))
         continue;
       devices.push({
         udid: device.udid,
@@ -1101,6 +1108,48 @@ var encodeMessage = (message) => {
     case "key":
       return encodeHid(OPCODE.key, message.event);
   }
+};
+
+// src/service/paste.ts
+var createPasteboard = (simctl) => ({
+  async read(udid) {
+    const result = await simctl(["simctl", "pbpaste", udid], { timeout: 5000 });
+    return result.ok && result.stdout.length > 0 ? result.stdout : null;
+  },
+  async write(udid, text) {
+    const written = await simctl(["simctl", "pbcopy", udid], { timeout: 5000, input: text });
+    if (!written.ok)
+      return false;
+    const back = await simctl(["simctl", "pbpaste", udid], { timeout: 5000 });
+    return back.ok && back.stdout === text;
+  }
+});
+var pasteChord = (layout) => pressSequence(strokeForChar("v", layout) ?? { usage: 25 }, { meta: true }).map((event) => ({ op: "key", event }));
+var sendInput = async (events, deps) => {
+  let skippedChars = 0;
+  let pasted = 0;
+  const buttons = [];
+  let chunk = [];
+  const flush = async () => {
+    if (chunk.length === 0)
+      return;
+    const result = deps.translate(chunk);
+    chunk = [];
+    skippedChars += result.skippedChars;
+    buttons.push(...result.buttons);
+    await deps.send(result.messages);
+  };
+  for (const event of events) {
+    if (event.type === "text" && deps.udid && typeText(event.text, deps.layout).skipped > 0 && await deps.pasteboard.write(deps.udid, event.text)) {
+      await flush();
+      await deps.send(pasteChord(deps.layout));
+      pasted += 1;
+      continue;
+    }
+    chunk.push(event);
+  }
+  await flush();
+  return { skippedChars, buttons, pasted };
 };
 
 // src/service/present.ts
@@ -1626,6 +1675,7 @@ var RECONNECT_MS = 300;
 var APPEARANCE_TTL_MS = 15000;
 var MIN_TOUCH_MS = 40;
 var KEY_GAP_MS = 8;
+var SKIPPED_SHOWN_MS = 8000;
 var PLACEHOLDER = { width: 402, height: 874, color: 1907483 };
 var CONFIG_OPCODE = 130;
 var sleep2 = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -1651,6 +1701,7 @@ var createSimulator = () => {
   let lastViewerAt = 0;
   let framed = true;
   let quality = DEFAULT_QUALITY;
+  let skipped = { count: 0, at: 0 };
   let streamUdid = null;
   let streamRequest = null;
   let streamConnected = false;
@@ -1914,6 +1965,7 @@ var createSimulator = () => {
         keyboard: active ? layouts.get(active.udid) ?? null : null,
         framed,
         quality,
+        skipped: Date.now() - skipped.at < SKIPPED_SHOWN_MS ? skipped.count : 0,
         error
       };
     },
@@ -1955,6 +2007,10 @@ var createSimulator = () => {
     },
     framed: () => framed,
     quality: () => quality,
+    noteSkipped(count) {
+      if (count > 0)
+        skipped = { count, at: Date.now() };
+    },
     setQuality(next) {
       quality = next;
     },
@@ -2029,10 +2085,12 @@ if (!port || !token) {
   process.exit(1);
 }
 var BODY_MAX = 1024 * 1024;
+var COPY_SETTLE_MS = 150;
 var ORIENTATIONS = ["portrait", "portrait_upside_down", "landscape_left", "landscape_right"];
 var PAGE_WAIT_MS = 1e4;
 var DEFAULT_BACKGROUND = [29, 27, 27];
 var sim = createSimulator();
+var pasteboard = createPasteboard((args, options) => run(XCRUN, args, options));
 var surfaceInput = { touching: false };
 var pageInput = { touching: false };
 var background = DEFAULT_BACKGROUND;
@@ -2136,10 +2194,16 @@ var handleInput = async (req, res) => {
   if (!shown || sim.hub.current()?.mime !== "image/jpeg")
     return send(res, 409, { error: "no simulator picture" });
   const layout = await sim.layout();
-  const { messages, skippedChars, buttons } = translateInput(batch.events, shown, surfaceInput, { degrees: view.degrees, layout, chrome: view.chrome });
-  await sim.sendHid(messages);
+  const { skippedChars, buttons } = await sendInput(batch.events, {
+    layout,
+    udid: sim.active()?.udid ?? null,
+    pasteboard,
+    translate: (events) => translateInput(events, shown, surfaceInput, { degrees: view.degrees, layout, chrome: view.chrome }),
+    send: (messages) => sim.sendHid(messages)
+  });
   for (const button of buttons)
     await sim.pressButton(button.name, button.page, button.usage);
+  sim.noteSkipped(skippedChars);
   send(res, 200, { ok: true, skippedChars });
 };
 var handlePageFrame = async (_req, res, url) => {
@@ -2182,8 +2246,14 @@ var handlePageInput = async (req, res) => {
   if (expected.width !== width || expected.height !== height)
     return send(res, 409, { error: "stale frame" });
   const layout = await sim.layout();
-  const { messages, skippedChars } = translateInput(batch.events, { width, height }, pageInput, { layout });
-  await sim.sendHid(messages);
+  const { skippedChars } = await sendInput(batch.events, {
+    layout,
+    udid: sim.active()?.udid ?? null,
+    pasteboard,
+    translate: (events) => translateInput(events, { width, height }, pageInput, { layout }),
+    send: (messages) => sim.sendHid(messages)
+  });
+  sim.noteSkipped(skippedChars);
   send(res, 200, { ok: true, skippedChars });
 };
 var handleChrome = async (_req, res) => {
@@ -2221,7 +2291,16 @@ var routes = {
     send(res, 200, { ok: true });
   },
   "POST /surface/resize": async (_req, res) => send(res, 400, { error: "fixed size" }),
-  "GET /surface/clipboard": async (_req, res) => send(res, 404, { error: "not supported" }),
+  "GET /surface/clipboard": async (_req, res) => {
+    const udid = sim.active()?.udid;
+    if (!udid)
+      return send(res, 404, { error: "no simulator" });
+    await new Promise((resolve) => setTimeout(resolve, COPY_SETTLE_MS));
+    const text = await pasteboard.read(udid);
+    if (text === null)
+      return send(res, 404, { error: "pasteboard empty or unreadable" });
+    send(res, 200, { text });
+  },
   "GET /state": async (_req, res) => send(res, 200, await sim.state()),
   "GET /stats": async (_req, res) => send(res, 200, { raw: sim.hub.current()?.seq ?? 0, shown: presenter.shown.current()?.seq ?? 0 }),
   "POST /select": async (req, res) => {

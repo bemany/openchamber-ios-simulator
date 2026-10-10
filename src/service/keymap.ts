@@ -142,13 +142,19 @@ export const pressSequence = (stroke: KeyStroke, extra: { meta?: boolean } = {})
 export const typeText = (text: string, layout: KeyboardLayout = 'us'): { events: HidKeyEvent[]; skipped: number } => {
   const events: HidKeyEvent[] = [];
   let skipped = 0;
-  for (const char of text.replace(/\r\n?/g, '\n')) {
+  const chars = [...text.replace(/\r\n?/g, '\n')];
+  let typed = ''; // the last character actually typed
+  for (let index = 0; index < chars.length; index += 1) {
+    const char = chars[index]!;
     const sequence = sequenceForChar(char, layout);
     if (!sequence) {
       skipped += 1;
+      // "Hallo 👋 café" would become "Hallo  café", and iOS turns a double space into ". ": drop one.
+      if (typed === ' ' && chars[index + 1] === ' ') index += 1;
       continue;
     }
     for (const stroke of sequence) events.push(...pressSequence(stroke));
+    typed = char;
   }
   return { events, skipped };
 };

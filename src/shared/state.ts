@@ -48,6 +48,8 @@ export type SimState = {
   /** The device frame is drawn around the picture (when Xcode has one for the device). */
   framed: boolean;
   quality: Quality;
+  /** Characters the last paste could not type (no key, pasteboard not writable); 0 after a few seconds. */
+  skipped: number;
   /** Last error for display, or `null`. */
   error: string | null;
 };

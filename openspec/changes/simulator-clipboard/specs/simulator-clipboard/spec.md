@@ -26,7 +26,7 @@ Pasted text SHALL arrive in the focused simulator text field unchanged, includin
 
 #### Scenario: Pasteboard not writable
 - **WHEN** writing the simulator's pasteboard has no effect
-- **THEN** `Hallo  caf` arrives as typed characters for a US layout and the toolbar notes 2 skipped characters
+- **THEN** `Hallo café` arrives as typed characters on a German simulator (one space where the emoji was) and the toolbar notes 1 character not typed
 
 ### Requirement: Clipboard text stays private
 The service SHALL NOT log, store or send clipboard text anywhere other than between the simulator's pasteboard and the requesting viewer.

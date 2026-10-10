@@ -20,6 +20,7 @@ The screenshots come from the preview harness (`bun run preview`), which draws t
 - **Toolbar**: Home, Rotate, Light/Dark, Lock, device frame on/off, picture size (**1:1**, **1:2**, **1:3**), and **Open in serve-sim**.
 - **Picture size**: full, half (default) or a third per side. Smaller is smoother, above all over the network. Frame, page and input follow the size.
 - **Device frame**: Xcode's own frame for the device, read from the Xcode installed on the machine; nothing is shipped. Its buttons can be clicked (volume, action, side button).
+- **Clipboard**: copying inside the simulator puts the text on your clipboard, and pasted text with characters the keyboard cannot type (emoji) goes through the simulator's pasteboard, whenever the simulator's pasteboard bridge accepts it (often not without Simulator.app; then the text is typed and the toolbar says how many characters were left out).
 - **Keyboard**: typed and pasted text arrives as written, through the simulator's own hardware keyboard layout: German, US, British, French, Spanish, Swiss German and Italian, including accented letters through dead keys (`é`, `ñ`, `ô`). The status tooltip names the layout in use.
 - **Open in serve-sim**: opens serve-sim's own interface, at an address you store on the page, in a tab of its own (see [Security boundary](#security-boundary)).
 
@@ -122,7 +123,7 @@ All behind the host's token, on `127.0.0.1`:
 
 | Route | |
 |---|---|
-| `GET /surface/frame`, `POST /surface/input`, `POST /surface/control`, `POST /surface/resize`, `GET /surface/clipboard` | OpenChamber shared surface |
+| `GET /surface/frame`, `POST /surface/input`, `POST /surface/control`, `POST /surface/resize`, `GET /surface/clipboard` | OpenChamber shared surface (the clipboard read answers 404 rather than an empty text) |
 | `GET /state`, `GET /stats` | devices, device shown, stream, orientation, appearance, keyboard, frame, picture size; frame counters for the bench |
 | `POST /select` `{ udid }`, `POST /boot` `{ udid }`, `POST /shutdown` | show a device; boot it (only on request); shut down the device shown |
 | `POST /button` `{ name, page?, usage? }`, `POST /rotate`, `POST /appearance` | toolbar actions and frame buttons |
@@ -148,18 +149,19 @@ All behind the host's token, on `127.0.0.1`:
 | Taps do nothing | serve-sim's input is shadowed by Device Hub | `serve-sim repair-input` (restarts SpringBoard), then reopen the panel |
 | Picture stutters over the network | Large frames | Use **1:2** or **1:3**, or hide the device frame |
 | **Open in serve-sim** opens the address row | No address stored yet | Enter the address in the row under the toolbar, then **Save** (or Enter) |
+| *N characters not typed* after a paste | The simulator's pasteboard did not take the text, so it was typed; emoji and characters without a key were left out | Expected without Simulator.app; type those characters on the simulator's own keyboard |
 | Typed characters come out wrong | The simulator's hardware keyboard layout has no table (only German, US, British, French, Spanish, Swiss German, Italian) | Typed as US; the status tooltip names the layout used. Open an issue for another layout |
 
 ## Limitations
 
-- Copying out of the simulator is not offered, and pasting types the text key by key, so characters without a key in the layout (emoji, rare accents) are skipped.
+- The simulator's pasteboard bridge (`simctl pbcopy`/`pbpaste`) usually does not take writes without Simulator.app running. Every write is read back first; when it does not stick, copying answers nothing (your clipboard stays as it was) and pasting types the text, skipping characters without a key (emoji).
 - Only the German table was checked on a simulator; the others come from the same generator, because a simulator's hardware layout could not be switched from a script.
 - Agents cannot call the extension yet: `contributes.tools` in OpenChamber 2.2 only changes how tool calls look.
 - iPhone apps that do not support landscape (Home Screen, Settings) appear sideways after Rotate, as in Simulator.app.
 
 ## Deutsch
 
-OpenChamber-Extension, die den iOS-Simulator der Maschine, auf der OpenChamber läuft, live im echten Xcode-Geräterahmen zeigt und bedienbar macht: Tippen, Wischen, Scrollen, Tastatur, Einfügen und die Tasten am Rahmen. Rail-Panel mit Leiste, Vollbild-Seite (Extension pages) und Statusabschnitt. Bildgröße 1:1, 1:2 (Standard) oder 1:3; halbe Größe mit Rahmen läuft mit knapp 28 Bildern pro Sekunde bei 41 KB pro Bild. Ein laufendes Gerät zu wählen schaltet sofort um; ein ausgeschaltetes bootet erst nach Klick auf **Starten**. **In serve-sim öffnen** öffnet eine selbst eingetragene serve-sim-Adresse in einem eigenen Tab (nur im eigenen Netz, nicht über das Relay; serve-sims Seite enthält eine Shell-Route). Die Extension selbst bindet serve-sim nur an `127.0.0.1`. Tastatur: Deutsch, US, Britisch, Französisch, Spanisch, Schweizerdeutsch und Italienisch, mit Akzenten über Tottasten. Die Oberfläche ist auf Deutsch, wenn OpenChamber auf Deutsch läuft.
+OpenChamber-Extension, die den iOS-Simulator der Maschine, auf der OpenChamber läuft, live im echten Xcode-Geräterahmen zeigt und bedienbar macht: Tippen, Wischen, Scrollen, Tastatur, Einfügen und die Tasten am Rahmen. Rail-Panel mit Leiste, Vollbild-Seite (Extension pages) und Statusabschnitt. Bildgröße 1:1, 1:2 (Standard) oder 1:3; halbe Größe mit Rahmen läuft mit knapp 28 Bildern pro Sekunde bei 41 KB pro Bild. Ein laufendes Gerät zu wählen schaltet sofort um; ein ausgeschaltetes bootet erst nach Klick auf **Starten**. **In serve-sim öffnen** öffnet eine selbst eingetragene serve-sim-Adresse in einem eigenen Tab (nur im eigenen Netz, nicht über das Relay; serve-sims Seite enthält eine Shell-Route). Die Extension selbst bindet serve-sim nur an `127.0.0.1`. Kopieren und Einfügen über die Simulator-Zwischenablage, wenn sie mitspielt (ohne Simulator.app meist nicht; dann wird getippt und die Leiste meldet ausgelassene Zeichen). Tastatur: Deutsch, US, Britisch, Französisch, Spanisch, Schweizerdeutsch und Italienisch, mit Akzenten über Tottasten. Die Oberfläche ist auf Deutsch, wenn OpenChamber auf Deutsch läuft.
 
 ## License
 

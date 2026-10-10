@@ -31,6 +31,8 @@ const APPEARANCE_TTL_MS = 15_000;
 /** iOS sometimes drops a tap with no duration; the serve-sim CLI holds 40 ms. */
 const MIN_TOUCH_MS = 40;
 const KEY_GAP_MS = 8;
+/** How long the toolbar notes skipped characters after a paste. */
+const SKIPPED_SHOWN_MS = 8_000;
 const PLACEHOLDER = { width: 402, height: 874, color: 0x1d1b1b };
 /** serve-sim's HID socket sends the screen config with this opcode. */
 const CONFIG_OPCODE = 130;
@@ -60,6 +62,7 @@ export const createSimulator = () => {
   let lastViewerAt = 0;
   let framed = true;
   let quality: Quality = DEFAULT_QUALITY;
+  let skipped: { count: number; at: number } = { count: 0, at: 0 };
 
   // Upstream MJPEG for exactly one device.
   let streamUdid: string | null = null;
@@ -325,6 +328,7 @@ export const createSimulator = () => {
         keyboard: active ? (layouts.get(active.udid) ?? null) : null,
         framed,
         quality,
+        skipped: Date.now() - skipped.at < SKIPPED_SHOWN_MS ? skipped.count : 0,
         error,
       };
     },
@@ -372,6 +376,11 @@ export const createSimulator = () => {
     framed: (): boolean => framed,
 
     quality: (): Quality => quality,
+
+    /** Remembers how many characters an input batch could not type, for the toolbar's note. */
+    noteSkipped(count: number) {
+      if (count > 0) skipped = { count, at: Date.now() };
+    },
 
     setQuality(next: Quality) {
       quality = next;

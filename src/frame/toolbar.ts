@@ -263,6 +263,7 @@ export const createToolbar = (bar: HTMLElement, host: () => HostClient, options:
       setStatus(state.error ? 'error' : '', text, state.error ?? text);
     }
     else if (state.error) setStatus('error', state.error);
+    else if (state.skipped > 0) setStatus('busy', t.skipped(state.skipped));
     else {
       const control = state.controller === 'user' ? `, ${t.controlUser}` : state.controller === 'agent' ? `, ${t.controlAgent}` : '';
       const text = `${state.streaming ? t.live : t.noStream}${control}`;

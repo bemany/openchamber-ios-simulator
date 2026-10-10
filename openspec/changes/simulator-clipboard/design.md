@@ -22,6 +22,13 @@
 - **Copy out is a read only.** After the host's copy chord reached the simulator, wait about 150 ms, then `pbpaste`; empty or failing reads answer 404.
 - **First task is the open question**, because it decides how often the fallback runs: find why `pbcopy` has no effect on some simulators (fresh boot timing, pasteboard daemon state, the simulator being shown in Simulator.app or not) and document the condition.
 
+## Findings (2026-10-10, task 1.1)
+
+- `simctl pbcopy <udid>` exits 0 but often writes nothing: `pbpaste -v` then reports "There are no items on the device's pasteboard". Seen on both running iOS 27.0 simulators in the afternoon; one of them had round-tripped correctly two hours earlier.
+- The one success happened while `com.apple.coredevice.dtpasteboardd` was not running on the device; in the failures it ran. Stopping it (`launchctl stop`) did not bring writes back, so its state is not the whole cause.
+- No `simctl pbsync` process and no Simulator.app were running in any case. Whether a running Simulator.app keeps the bridge alive is untested.
+- Conclusion so far: the pasteboard bridge is unreliable without Simulator.app; the read-back check is mandatory, and the typing fallback will be the common path.
+
 ## Risks / Trade-offs
 
 - [Reading the pasteboard after Cmd+C may return the previous content if the app copies late] → Wait briefly and accept it; the user can copy again.

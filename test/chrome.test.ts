@@ -214,4 +214,16 @@ describe('device types', () => {
     expect(devices[0]?.deviceType).toBe('com.apple.CoreSimulator.SimDeviceType.iPhone-18-Pro');
     expect(devices[1]?.deviceType).toBeUndefined();
   });
+
+  test('a renamed simulator counts by its device type; other device types do not', () => {
+    const json = JSON.stringify({
+      devices: {
+        'com.apple.CoreSimulator.SimRuntime.iOS-27-0': [
+          { udid: 'R', name: 'My test phone', state: 'Booted', deviceTypeIdentifier: 'com.apple.CoreSimulator.SimDeviceType.iPhone-17e' },
+          { udid: 'T', name: 'iPhone-ish TV', state: 'Shutdown', deviceTypeIdentifier: 'com.apple.CoreSimulator.SimDeviceType.Apple-TV-4K' },
+        ],
+      },
+    });
+    expect(parseDevices(json).map((device) => device.udid)).toEqual(['R']);
+  });
 });

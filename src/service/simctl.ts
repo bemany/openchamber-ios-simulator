@@ -36,7 +36,9 @@ export const parseDevices = (json: string): Device[] => {
   for (const runtime of runtimes) {
     for (const device of parsed.devices?.[runtime] ?? []) {
       if (!device.udid || !device.name || device.isAvailable === false) continue;
-      if (!/^(iPhone|iPad)\b/.test(device.name)) continue;
+      // By device type, so a renamed simulator ("My test phone") still counts; the name only when the type is missing.
+      const type = device.deviceTypeIdentifier ?? '';
+      if (type ? !/SimDeviceType\.(iPhone|iPad)/.test(type) : !/^(iPhone|iPad)\b/.test(device.name)) continue;
       devices.push({
         udid: device.udid,
         name: device.name,

@@ -14,10 +14,12 @@ import {
   SURFACE_WIDTH_HEADER,
 } from '@openchamber/sdk';
 
-import { BLOB_CHUNK, QUALITIES, QUALITY_DIVISOR, type BlobRef, type ChromeAnswer, type Orientation, type PageFrame } from '../shared/state.ts';
+import { BLOB_CHUNK, QUALITIES, QUALITY_DIVISOR, type BlobRef, type ChromeAnswer, type ChromeButton, type Orientation, type PageFrame } from '../shared/state.ts';
 import { loadChrome, type ChromeAssets } from './chrome.ts';
 import { parseColor, shrunkSize } from './compose.ts';
+import { run, XCRUN } from './exec.ts';
 import { translateInput, type InputState } from './input.ts';
+import { createPasteboard, sendInput } from './paste.ts';
 import { createPresenter, sameView } from './present.ts';
 import { rotationFor } from './rotate.ts';
 import { screenshot } from './simctl.ts';
@@ -31,6 +33,8 @@ if (!port || !token) {
 }
 
 const BODY_MAX = 1024 * 1024;
+/** After Cmd+C reached the simulator, give the app a moment to fill the pasteboard. */
+const COPY_SETTLE_MS = 150;
 const ORIENTATIONS: Orientation[] = ['portrait', 'portrait_upside_down', 'landscape_left', 'landscape_right'];
 
 /** The page waits at most this long for a newer picture; the host proxy should not time out first. */
@@ -39,6 +43,7 @@ const PAGE_WAIT_MS = 10_000;
 const DEFAULT_BACKGROUND: [number, number, number] = [0x1d, 0x1b, 0x1b];
 
 const sim = createSimulator();
+const pasteboard = createPasteboard((args, options) => run(XCRUN, args, options));
 const surfaceInput: InputState = { touching: false };
 const pageInput: InputState = { touching: false };
 let background = DEFAULT_BACKGROUND;
@@ -147,9 +152,15 @@ const handleInput = async (req: http.IncomingMessage, res: http.ServerResponse) 
   }
   if (!shown || sim.hub.current()?.mime !== 'image/jpeg') return send(res, 409, { error: 'no simulator picture' });
   const layout = await sim.layout();
-  const { messages, skippedChars, buttons } = translateInput(batch.events, shown, surfaceInput, { degrees: view.degrees, layout, chrome: view.chrome });
-  await sim.sendHid(messages);
-  for (const button of buttons) await sim.pressButton(button.name, button.page, button.usage);
+  const { skippedChars, buttons } = await sendInput(batch.events, {
+    layout,
+    udid: sim.active()?.udid ?? null,
+    pasteboard,
+    translate: (events) => translateInput(events, shown, surfaceInput, { degrees: view.degrees, layout, chrome: view.chrome }),
+    send: (messages) => sim.sendHid(messages),
+  });
+  for (const button of buttons as ChromeButton[]) await sim.pressButton(button.name, button.page, button.usage);
+  sim.noteSkipped(skippedChars);
   send(res, 200, { ok: true, skippedChars });
 };
 
@@ -193,8 +204,14 @@ const handlePageInput = async (req: http.IncomingMessage, res: http.ServerRespon
   const expected = shrunkSize(current.width, current.height, divisor());
   if (expected.width !== width || expected.height !== height) return send(res, 409, { error: 'stale frame' });
   const layout = await sim.layout();
-  const { messages, skippedChars } = translateInput(batch.events, { width, height }, pageInput, { layout });
-  await sim.sendHid(messages);
+  const { skippedChars } = await sendInput(batch.events, {
+    layout,
+    udid: sim.active()?.udid ?? null,
+    pasteboard,
+    translate: (events) => translateInput(events, { width, height }, pageInput, { layout }),
+    send: (messages) => sim.sendHid(messages),
+  });
+  sim.noteSkipped(skippedChars);
   send(res, 200, { ok: true, skippedChars });
 };
 
@@ -238,7 +255,15 @@ const routes: Record<string, Route> = {
   // The simulator has a fixed screen size; the host scales the picture.
   'POST /surface/resize': async (_req, res) => send(res, 400, { error: 'fixed size' }),
   // Not offered: `simctl pbpaste` is unreliable, and an empty answer would clear the user's clipboard.
-  'GET /surface/clipboard': async (_req, res) => send(res, 404, { error: 'not supported' }),
+  // After the copy chord: the simulator's pasteboard text, or 404 (never an empty text, which would clear the user's clipboard).
+  'GET /surface/clipboard': async (_req, res) => {
+    const udid = sim.active()?.udid;
+    if (!udid) return send(res, 404, { error: 'no simulator' });
+    await new Promise((resolve) => setTimeout(resolve, COPY_SETTLE_MS));
+    const text = await pasteboard.read(udid);
+    if (text === null) return send(res, 404, { error: 'pasteboard empty or unreadable' });
+    send(res, 200, { text });
+  },
 
   'GET /state': async (_req, res) => send(res, 200, await sim.state()),
   /** Counters for scripts/bench.mjs: raw frames from serve-sim and pictures prepared for the surface so far. */

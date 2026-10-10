@@ -88,6 +88,12 @@ describe('keymap', () => {
     ]);
   });
 
+  test('a skipped character between two spaces leaves one space (iOS turns two into ". ")', () => {
+    const spaces = (text: string) => downs(text, 'de').filter((usage) => usage === HID.space).length;
+    expect(spaces('Hallo \u{1F44B} café')).toBe(1);
+    expect(spaces('a \u{1F44B}')).toBe(1);
+  });
+
   test('typeText skips characters without a key and normalizes line ends', () => {
     const { events, skipped } = typeText('a\u{1F600}\r\n', 'de');
     expect(skipped).toBe(1);
