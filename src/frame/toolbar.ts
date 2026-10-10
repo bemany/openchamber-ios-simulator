@@ -155,6 +155,8 @@ export const createToolbar = (bar: HTMLElement, host: () => HostClient, options:
     attachTooltips({
       host,
       buttons: () => [...bar.querySelectorAll<HTMLElement>('button.ib')],
+      // The status's tooltip names the device and the keyboard layout typed with.
+      extras: () => [status],
       showInStatus: (text) => {
         hint = text;
         statusText.textContent = hint ?? statusShown;
@@ -263,7 +265,10 @@ export const createToolbar = (bar: HTMLElement, host: () => HostClient, options:
     else if (state.error) setStatus('error', state.error);
     else {
       const control = state.controller === 'user' ? `, ${t.controlUser}` : state.controller === 'agent' ? `, ${t.controlAgent}` : '';
-      setStatus(state.streaming ? 'on' : '', `${state.streaming ? t.live : t.noStream}${control}`);
+      const text = `${state.streaming ? t.live : t.noStream}${control}`;
+      // The tooltip names the keyboard layout typed with, so a wrong guess is visible.
+      const keyboard = state.keyboard ? `. ${t.keyboard}: ${t.layouts[state.keyboard]}` : '';
+      setStatus(state.streaming ? 'on' : '', text, `${state.active?.name ?? text}${keyboard}`);
     }
   };
 

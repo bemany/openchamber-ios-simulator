@@ -1,9 +1,11 @@
 // Keyboard input for the simulator. serve-sim only takes USB HID usages; which
 // character a usage produces is decided by the simulator's hardware keyboard
-// layout. We translate characters through a table for that layout (Apple
-// layouts, Option instead of AltGr), so "@" arrives as "@" whatever layout the
-// viewer's own keyboard has.
+// layout. Characters are typed through a table for that layout, so "@" arrives
+// as "@" whatever layout the viewer's own keyboard has. The tables come from
+// macOS's own layouts (scripts/build-layouts.ts), which iOS shares; the German
+// one was checked key by key against a simulator (scripts/discover-layout.ts).
 import type { KeyboardLayout } from '../shared/state.ts';
+import { LAYOUT_STROKES } from './layouts.generated.ts';
 
 export const HID = {
   enter: 0x28,
@@ -19,99 +21,87 @@ export const HID = {
 
 export type KeyStroke = { usage: number; shift?: boolean; alt?: boolean };
 
-type Layout = Map<string, KeyStroke>;
+/** "31s" -> usage 31 (0x1f) with Shift; "15a" -> usage 15 with Option. */
+const parseStroke = (text: string): KeyStroke => {
+  const match = /^(\d+)(s?)(a?)$/.exec(text);
+  if (!match) throw new Error(`bad stroke ${text}`);
+  return { usage: Number(match[1]), ...(match[2] ? { shift: true } : {}), ...(match[3] ? { alt: true } : {}) };
+};
 
-const letter = (char: string): number => 0x04 + char.charCodeAt(0) - 'a'.charCodeAt(0);
+type Table = Map<string, KeyStroke[]>;
 
-const addPairs = (map: Layout, pairs: Array<[string, number, string]>) => {
-  for (const [char, usage, upper] of pairs) {
-    map.set(char, { usage });
-    map.set(upper, { usage, shift: true });
+const buildTable = (strokes: Record<string, string>): Table => {
+  const table: Table = new Map(Object.entries(strokes).map(([char, sequence]) => [char, sequence.split(' ').map(parseStroke)]));
+  table.set(' ', [{ usage: HID.space }]);
+  table.set('\n', [{ usage: HID.enter }]);
+  table.set('\t', [{ usage: HID.tab }]);
+  return table;
+};
+
+const TABLES = new Map<KeyboardLayout, Table>();
+const tableFor = (layout: KeyboardLayout): Table => {
+  let table = TABLES.get(layout);
+  if (!table) {
+    table = buildTable(LAYOUT_STROKES[layout]);
+    TABLES.set(layout, table);
   }
+  return table;
 };
 
-const base = (swapYZ: boolean, shiftedDigits: string): Layout => {
-  const map: Layout = new Map();
-  for (const char of 'abcdefghijklmnopqrstuvwxyz') {
-    const usage = swapYZ && char === 'y' ? letter('z') : swapYZ && char === 'z' ? letter('y') : letter(char);
-    map.set(char, { usage });
-    map.set(char.toUpperCase(), { usage, shift: true });
-  }
-  const digits = '1234567890';
-  for (let i = 0; i < digits.length; i += 1) {
-    map.set(digits[i]!, { usage: 0x1e + i });
-    map.set(shiftedDigits[i]!, { usage: 0x1e + i, shift: true });
-  }
-  map.set(' ', { usage: HID.space });
-  map.set('\n', { usage: HID.enter });
-  map.set('\t', { usage: HID.tab });
-  return map;
+/** Every layout with a table. */
+export const KEYBOARD_LAYOUTS = Object.keys(LAYOUT_STROKES).sort() as KeyboardLayout[];
+
+/** `hw=` names in `AppleKeyboards` entries, for layouts set explicitly. */
+const HARDWARE_NAMES: Record<string, KeyboardLayout> = {
+  German: 'de',
+  'U.S.': 'us',
+  US: 'us',
+  British: 'gb',
+  French: 'fr',
+  Spanish: 'es',
+  'Spanish - ISO': 'es',
+  'Swiss German': 'ch',
+  Italian: 'it',
+  'Italian - Pro': 'it',
 };
 
-/** German (Apple ISO). Checked key by key on an iOS 27 simulator set to `de_DE`. */
-const german = (): Layout => {
-  const map = base(true, '!"§$%&/()=');
-  addPairs(map, [
-    ['ß', 0x2d, '?'],
-    ['ü', 0x2f, 'Ü'],
-    ['+', 0x30, '*'],
-    ['#', 0x32, "'"],
-    ['ö', 0x33, 'Ö'],
-    ['ä', 0x34, 'Ä'],
-    [',', 0x36, ';'],
-    ['.', 0x37, ':'],
-    ['-', 0x38, '_'],
-    // Apple ISO keyboards swap these two usages: 0x35 is "<", 0x64 is "^".
-    ['<', 0x35, '>'],
-    ['^', 0x64, '°'],
-  ]);
-  const option: Array<[string, KeyStroke]> = [
-    ['@', { usage: letter('l'), alt: true }],
-    ['€', { usage: letter('e'), alt: true }],
-    ['[', { usage: 0x22, alt: true }],
-    [']', { usage: 0x23, alt: true }],
-    ['|', { usage: 0x24, alt: true }],
-    ['{', { usage: 0x25, alt: true }],
-    ['}', { usage: 0x26, alt: true }],
-    ['\\', { usage: 0x24, alt: true, shift: true }],
-  ];
-  for (const [char, stroke] of option) map.set(char, stroke);
-  return map;
+/** A locale such as `de_CH` or `en-GB` to the layout iOS picks for it, or `null`. */
+export const layoutFromLocale = (locale: string): KeyboardLayout | null => {
+  const match = /^([a-z]{2,3})(?:[_-]([A-Z]{2}))?/.exec(locale.trim());
+  if (!match) return null;
+  const [, language, region] = match;
+  if (language === 'de') return region === 'CH' ? 'ch' : 'de';
+  if (language === 'en') return region === 'GB' ? 'gb' : 'us';
+  if (language === 'fr') return region === 'FR' || !region ? 'fr' : null; // Canadian, Belgian and Swiss French differ
+  if (language === 'es') return region === 'ES' || !region ? 'es' : null; // Latin American Spanish differs
+  if (language === 'it') return 'it';
+  return null;
 };
-
-/** US (ANSI). */
-const us = (): Layout => {
-  const map = base(false, '!@#$%^&*()');
-  addPairs(map, [
-    ['-', 0x2d, '_'],
-    ['=', 0x2e, '+'],
-    ['[', 0x2f, '{'],
-    [']', 0x30, '}'],
-    ['\\', 0x31, '|'],
-    [';', 0x33, ':'],
-    ["'", 0x34, '"'],
-    ['`', 0x35, '~'],
-    [',', 0x36, '<'],
-    ['.', 0x37, '>'],
-    ['/', 0x38, '?'],
-  ]);
-  return map;
-};
-
-const LAYOUTS: Record<KeyboardLayout, Layout> = { de: german(), us: us() };
 
 /**
- * The layout for a simulator's first `AppleKeyboards` entry, for example
- * `de_DE@sw=QWERTZ-German;hw=Automatic`. Unknown layouts fall back to `us`.
+ * The layout for a simulator's first `AppleKeyboards` entry (for example
+ * `de_DE@sw=QWERTZ-German;hw=Automatic`): an explicit `hw=` name wins, else
+ * the entry's locale. Without an entry the device locale decides (a fresh
+ * simulator has none). Anything else is typed as `us`.
  */
-export const layoutFromKeyboards = (keyboards: string): KeyboardLayout => {
-  const first = /"?([a-z]{2})(?:[_-][A-Za-z]+)?@/.exec(keyboards);
-  return first?.[1] === 'de' ? 'de' : 'us';
+export const layoutFromKeyboards = (keyboards: string, locale = ''): KeyboardLayout => {
+  const first = /"?([a-zA-Z_-]+)@([^"\n]*)/.exec(keyboards);
+  if (first) {
+    const hardware = /hw=([^;"]+)/.exec(first[2] ?? '')?.[1]?.trim();
+    if (hardware && hardware !== 'Automatic' && HARDWARE_NAMES[hardware]) return HARDWARE_NAMES[hardware];
+    return layoutFromLocale(first[1]!) ?? 'us';
+  }
+  return layoutFromLocale(locale) ?? 'us';
 };
 
-/** The key stroke for one character, or `null` when the layout has no key for it. */
-export const strokeForChar = (char: string, layout: KeyboardLayout = 'us'): KeyStroke | null =>
-  LAYOUTS[layout].get(char) ?? null;
+/** The key strokes for one character, or `null` when the layout has no way to type it. */
+export const sequenceForChar = (char: string, layout: KeyboardLayout = 'us'): KeyStroke[] | null => tableFor(layout).get(char) ?? null;
+
+/** The single key stroke for one character (no dead key), or `null`. Used for shortcuts. */
+export const strokeForChar = (char: string, layout: KeyboardLayout = 'us'): KeyStroke | null => {
+  const sequence = sequenceForChar(char, layout);
+  return sequence?.length === 1 ? sequence[0]! : null;
+};
 
 /** Non-printing keys by `KeyboardEvent.key`. */
 const NAMED_KEYS: Record<string, number> = {
@@ -148,17 +138,17 @@ export const pressSequence = (stroke: KeyStroke, extra: { meta?: boolean } = {})
   ];
 };
 
-/** Text as key presses. Characters without a key (emoji, accents) are skipped and counted. */
+/** Text as key presses (a dead key and its follower for composed characters). Characters without keys are skipped and counted. */
 export const typeText = (text: string, layout: KeyboardLayout = 'us'): { events: HidKeyEvent[]; skipped: number } => {
   const events: HidKeyEvent[] = [];
   let skipped = 0;
   for (const char of text.replace(/\r\n?/g, '\n')) {
-    const stroke = strokeForChar(char, layout);
-    if (!stroke) {
+    const sequence = sequenceForChar(char, layout);
+    if (!sequence) {
       skipped += 1;
       continue;
     }
-    events.push(...pressSequence(stroke));
+    for (const stroke of sequence) events.push(...pressSequence(stroke));
   }
   return { events, skipped };
 };

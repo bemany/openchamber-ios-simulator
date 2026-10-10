@@ -20,7 +20,7 @@ The screenshots come from the preview harness (`bun run preview`), which draws t
 - **Toolbar**: Home, Rotate, Light/Dark, Lock, device frame on/off, picture size (**1:1**, **1:2**, **1:3**), and **Open in serve-sim**.
 - **Picture size**: full, half (default) or a third per side. Smaller is smoother, above all over the network. Frame, page and input follow the size.
 - **Device frame**: Xcode's own frame for the device, read from the Xcode installed on the machine; nothing is shipped. Its buttons can be clicked (volume, action, side button).
-- **Keyboard**: typed and pasted text arrives as written, through the simulator's own hardware keyboard layout (German and US built in).
+- **Keyboard**: typed and pasted text arrives as written, through the simulator's own hardware keyboard layout: German, US, British, French, Spanish, Swiss German and Italian, including accented letters through dead keys (`é`, `ñ`, `ô`). The status tooltip names the layout in use.
 - **Open in serve-sim**: opens serve-sim's own interface, at an address you store on the page, in a tab of its own (see [Security boundary](#security-boundary)).
 
 ## Speed
@@ -81,6 +81,8 @@ node scripts/smoke.mjs              # start the built service like OpenChamber a
 node scripts/bench.mjs              # frames per second and size per mode (turns the device shown)
 node scripts/gap.mjs                # longest picture pause when a helper dies or another simulator shuts down
 node scripts/switch.mjs             # time to switch between two running devices (SWITCH_A, SWITCH_B)
+bun scripts/build-layouts.ts        # regenerate the keyboard tables from macOS's own layouts (needs swift)
+bun scripts/discover-layout.ts      # read a layout key by key from a throwaway simulator, to check a table
 bun run preview                     # stand-in host on http://127.0.0.1:4790/<random>/, page at <random>/page
 ```
 
@@ -112,7 +114,7 @@ bun run preview                     # stand-in host on http://127.0.0.1:4790/<ra
 - **Picture**: the service reads serve-sim's MJPEG stream and hands the newest frame to OpenChamber's surface (`GET /surface/frame`) while a viewer is open. Workers shrink it to the chosen size, put it into the device frame (the screen goes through the frame's rounded-corner mask) and turn the whole device for landscape.
 - **Device frame**: the device type's `capabilities.plist` gives the screen size, scale, frame id and mask; `/Library/Developer/DeviceKit/Chrome/<id>.devicechrome` gives `chrome.json` and the PDFs (a composite body or nine slices, plus buttons). PDFs are rendered with `sips` once per size and cached in `$TMPDIR`; buttons are placed the way serve-sim places them. JPEG has no alpha, so the panel sends its background colour (`POST /frame-style`).
 - **Full-screen page**: extensions cannot open windows, so the larger view is an extension page (`contributes.page`). It draws shrunk raw frames in a canvas, lays the frame over them as an image with a CSS mask, turns the device with CSS and maps input back to picture pixels (`POST /page/input`). OpenChamber cuts a `serviceRequest` answer at 256 000 characters, so frames and frame images travel as references whose base64 the page fetches in parts (`GET /blob`).
-- **Input**: pointer, wheel and keys become serve-sim HID messages (touch begin/move/end, scroll, key usages) normalized to the screen. A click on a frame button presses it; a click on the rest of the bezel does nothing. Characters go through a table for the simulator's hardware keyboard layout, read from its `AppleKeyboards` setting.
+- **Input**: pointer, wheel and keys become serve-sim HID messages (touch begin/move/end, scroll, key usages) normalized to the screen. A click on a frame button presses it; a click on the rest of the bezel does nothing. Characters go through a table for the simulator's hardware keyboard layout, read from its `AppleKeyboards` setting (or its locale when that is missing). The tables are generated from macOS's own keyboard layouts, which iOS shares; the German one was checked against a simulator key by key (217 of 217 characters).
 
 ### Service routes
 
@@ -146,17 +148,18 @@ All behind the host's token, on `127.0.0.1`:
 | Taps do nothing | serve-sim's input is shadowed by Device Hub | `serve-sim repair-input` (restarts SpringBoard), then reopen the panel |
 | Picture stutters over the network | Large frames | Use **1:2** or **1:3**, or hide the device frame |
 | **Open in serve-sim** opens the address row | No address stored yet | Enter the address in the row under the toolbar, then **Save** (or Enter) |
-| Typed characters come out wrong | The simulator's hardware keyboard layout is neither German nor US | Typed as US for now (see the issues) |
+| Typed characters come out wrong | The simulator's hardware keyboard layout has no table (only German, US, British, French, Spanish, Swiss German, Italian) | Typed as US; the status tooltip names the layout used. Open an issue for another layout |
 
 ## Limitations
 
-- Copying out of the simulator is not offered, and pasting types the text key by key, so characters without a key in the layout (emoji, some accents) are skipped.
+- Copying out of the simulator is not offered, and pasting types the text key by key, so characters without a key in the layout (emoji, rare accents) are skipped.
+- Only the German table was checked on a simulator; the others come from the same generator, because a simulator's hardware layout could not be switched from a script.
 - Agents cannot call the extension yet: `contributes.tools` in OpenChamber 2.2 only changes how tool calls look.
 - iPhone apps that do not support landscape (Home Screen, Settings) appear sideways after Rotate, as in Simulator.app.
 
 ## Deutsch
 
-OpenChamber-Extension, die den iOS-Simulator der Maschine, auf der OpenChamber läuft, live im echten Xcode-Geräterahmen zeigt und bedienbar macht: Tippen, Wischen, Scrollen, Tastatur, Einfügen und die Tasten am Rahmen. Rail-Panel mit Leiste, Vollbild-Seite (Extension pages) und Statusabschnitt. Bildgröße 1:1, 1:2 (Standard) oder 1:3; halbe Größe mit Rahmen läuft mit knapp 28 Bildern pro Sekunde bei 41 KB pro Bild. Ein laufendes Gerät zu wählen schaltet sofort um; ein ausgeschaltetes bootet erst nach Klick auf **Starten**. **In serve-sim öffnen** öffnet eine selbst eingetragene serve-sim-Adresse in einem eigenen Tab (nur im eigenen Netz, nicht über das Relay; serve-sims Seite enthält eine Shell-Route). Die Extension selbst bindet serve-sim nur an `127.0.0.1`. Die Oberfläche ist auf Deutsch, wenn OpenChamber auf Deutsch läuft.
+OpenChamber-Extension, die den iOS-Simulator der Maschine, auf der OpenChamber läuft, live im echten Xcode-Geräterahmen zeigt und bedienbar macht: Tippen, Wischen, Scrollen, Tastatur, Einfügen und die Tasten am Rahmen. Rail-Panel mit Leiste, Vollbild-Seite (Extension pages) und Statusabschnitt. Bildgröße 1:1, 1:2 (Standard) oder 1:3; halbe Größe mit Rahmen läuft mit knapp 28 Bildern pro Sekunde bei 41 KB pro Bild. Ein laufendes Gerät zu wählen schaltet sofort um; ein ausgeschaltetes bootet erst nach Klick auf **Starten**. **In serve-sim öffnen** öffnet eine selbst eingetragene serve-sim-Adresse in einem eigenen Tab (nur im eigenen Netz, nicht über das Relay; serve-sims Seite enthält eine Shell-Route). Die Extension selbst bindet serve-sim nur an `127.0.0.1`. Tastatur: Deutsch, US, Britisch, Französisch, Spanisch, Schweizerdeutsch und Italienisch, mit Akzenten über Tottasten. Die Oberfläche ist auf Deutsch, wenn OpenChamber auf Deutsch läuft.
 
 ## License
 

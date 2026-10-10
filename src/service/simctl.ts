@@ -115,10 +115,14 @@ export const setAppearance = async (udid: string, appearance: 'light' | 'dark'):
   if (!result.ok) throw new Error(result.stderr.trim() || 'Could not set the appearance');
 };
 
-/** The simulator's hardware keyboard layout, from its first `AppleKeyboards` entry. */
+/** The simulator's hardware keyboard layout, from its first `AppleKeyboards` entry or else its locale. */
 export const readKeyboardLayout = async (udid: string): Promise<KeyboardLayout> => {
-  const result = await run(XCRUN, ['simctl', 'spawn', udid, 'defaults', 'read', '-g', 'AppleKeyboards'], { timeout: 10_000 });
-  return result.ok ? layoutFromKeyboards(result.stdout) : 'us';
+  const [keyboards, locale] = await Promise.all([
+    run(XCRUN, ['simctl', 'spawn', udid, 'defaults', 'read', '-g', 'AppleKeyboards'], { timeout: 10_000 }),
+    // A fresh simulator has no AppleKeyboards entry; its keyboard follows the device locale.
+    run(XCRUN, ['simctl', 'spawn', udid, 'defaults', 'read', '-g', 'AppleLocale'], { timeout: 10_000 }),
+  ]);
+  return layoutFromKeyboards(keyboards.ok ? keyboards.stdout : '', locale.ok ? locale.stdout.trim() : '');
 };
 
 /** Full-resolution PNG screenshot. */

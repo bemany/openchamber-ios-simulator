@@ -2,19 +2,19 @@
 
 ## 1. Detection
 
-- [ ] 1.1 Extend `KeyboardLayout` and `layoutFromKeyboards` for `fr`, `gb`, `es`, `ch`, `it` (by language and region, e.g. `de_CH` is Swiss, `en_GB` is UK); verify with unit tests over real `AppleKeyboards` outputs
-- [ ] 1.2 Name the layout used in the status tooltip (panel and page); verify in the preview with the German simulator ("Keyboard: German")
+- [x] 1.1 Extend `KeyboardLayout` and `layoutFromKeyboards` for `fr`, `gb`, `es`, `ch`, `it` (by language and region, e.g. `de_CH` is Swiss, `en_GB` is UK; explicit `hw=` names; the device locale when `AppleKeyboards` is missing); verify with unit tests over real `AppleKeyboards` outputs
+- [x] 1.2 Name the layout used in the status tooltip (panel and page); verify in the preview with the German simulator ("Keyboard: German")
 
 ## 2. Tables
 
-- [ ] 2.1 Write the French AZERTY table (letters, digit row with and without Shift, Option characters `@ # [ ] { } | \`); verify with unit tests for the remapped keys
-- [ ] 2.2 Write UK, Spanish, Swiss German and Italian tables the same way; verify with unit tests per layout
-- [ ] 2.3 Check the US table on an ISO keyboard (0x35/0x64) and fix it if needed; verify on a simulator set to `en_US`
+- [x] 2.1 Generate all tables from macOS's layouts (`scripts/macos-layouts.swift`, `scripts/build-layouts.ts`, Apple ISO keyboard type, dead keys with space and letters); verify the German result against the table read from a simulator with `scripts/discover-layout.ts` (217 of 217 identical)
+- [x] 2.2 Type dead-key sequences (`sequenceForChar`, `typeText`); verify with unit tests (French `azerty@é`, German `^` and `é`, every layout types printable ASCII)
+- [x] 2.3 The US table now comes from the ISO keyboard type like German (0x35/0x64 as on Apple ISO keyboards); verify with the unit test for US positions
 
 ## 3. Check on simulators
 
-- [ ] 3.1 With the owner's go, create a throwaway simulator, set its `AppleKeyboards` per layout, type each table's full character set into a text field and compare against a screenshot; delete the simulator afterwards
-- [ ] 3.2 Record per layout which characters were verified in the README limitations section
+- [x] 3.1 On a throwaway simulator (German), type `é ñ ^ ô @ ß Zürich` through `typeText` and read it back from the text field (exact match); switching the simulator to other hardware layouts did not take effect (hw=, locale, Ctrl/Cmd+Space), so per-layout typing tests are not possible here; delete the simulator afterwards
+- [x] 3.2 Record in the README which layouts exist, how they were made, and that only German was checked on a simulator
 
 ## 4. Release
 

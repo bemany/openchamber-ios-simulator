@@ -17,7 +17,7 @@ export type Orientation = 'portrait' | 'portrait_upside_down' | 'landscape_left'
 export type Appearance = 'light' | 'dark' | 'unknown';
 
 /** Hardware keyboard layouts the service can type in; anything else is typed as `us`. */
-export type KeyboardLayout = 'de' | 'us';
+export type KeyboardLayout = 'ch' | 'de' | 'es' | 'fr' | 'gb' | 'it' | 'us';
 
 export type Busy = 'booting' | 'shutting-down' | null;
 

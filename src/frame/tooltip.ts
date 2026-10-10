@@ -16,27 +16,32 @@ export type TooltipOptions = {
   host: () => HostClient;
   /** The buttons to explain, read when attaching (after the toolbar is complete). */
   buttons: () => HTMLElement[];
+  /** More elements that get the popover only (the status, whose own text is the fallback). */
+  extras?: () => HTMLElement[];
   /** Fallback without popovers: show this text in place of the status, `null` to restore it. */
   showInStatus: (text: string | null) => void;
 };
 
-const labelOf = (button: HTMLElement): string => button.getAttribute('aria-label') ?? button.title ?? '';
+/** A button's accessible name; for other elements (the status) their current title, which changes with the state. */
+const labelOf = (element: HTMLElement): string =>
+  element.tagName === 'BUTTON' ? (element.getAttribute('aria-label') ?? element.title ?? '') : element.title;
 
 /** Wires tooltips once the host said whether it can show popovers. */
-export const attachTooltips = ({ host, buttons, showInStatus }: TooltipOptions) => {
+export const attachTooltips = ({ host, buttons, extras, showInStatus }: TooltipOptions) => {
   let attached = false;
   host().onReady((context) => {
     if (attached || context.surface === 'popover') return;
     attached = true;
     if (context.features?.popovers) {
-      for (const button of buttons()) {
-        mountPopoverAnchor(button, {
+      for (const element of [...buttons(), ...(extras?.() ?? [])]) {
+        mountPopoverAnchor(element, {
           host: host(),
-          getData: (): JsonValue => ({ tooltip: labelOf(button) }),
+          getData: (): JsonValue => ({ tooltip: labelOf(element) }),
           width: WIDTH,
           height: HEIGHT,
           side: 'bottom',
-          label: labelOf(button),
+          // Buttons keep their own accessible name up to date; the status must not get a fixed one.
+          ...(element.tagName === 'BUTTON' ? { label: labelOf(element) } : {}),
         });
       }
       return;
