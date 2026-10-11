@@ -14,4 +14,4 @@
 ## 3. Rule, docs, release
 
 - [x] 3.1 AGENTS.md, README (features, security boundary, German section), `openspec/config.yaml`: the changed rule
-- [ ] 3.2 `bun run check`, `node scripts/smoke.mjs`, privacy grep, commit with `dist/`, release after the owner's go, close #11 when the change is archived
+- [x] 3.2 `bun run check`, `node scripts/smoke.mjs`, privacy grep, commit with `dist/`, release after the owner's go, close #11 when the change is archived

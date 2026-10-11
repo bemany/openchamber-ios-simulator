@@ -12,4 +12,4 @@
 ## 3. Docs and release
 
 - [x] 3.1 README: features, troubleshooting row "N serve-sim on this device", permissions (`ps`)
-- [ ] 3.2 `bun run check`, `node scripts/smoke.mjs`, privacy grep, commit with `dist/`, release after the owner's go (the new permission needs approval after the update), close #12 when the change is archived
+- [x] 3.2 `bun run check`, `node scripts/smoke.mjs`, privacy grep, commit with `dist/`, release after the owner's go (the new permission needs approval after the update), close #12 when the change is archived
