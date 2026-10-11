@@ -5,6 +5,7 @@
 import type { HostClient } from '@openchamber/sdk';
 
 import { DIRECT_URL_KEY, normalizeDirectUrl } from '../shared/direct.ts';
+import type { ServeSimServer } from '../shared/state.ts';
 import type { FrameContext } from './host.ts';
 import { element, icon, installStyle } from './ui.ts';
 
@@ -14,6 +15,8 @@ const EDITOR_CSS = `
 .direct button{font:inherit;color:var(--oc-fg);background:transparent;border:1px solid var(--oc-border);border-radius:var(--oc-radius,6px);height:26px;padding:0 10px;cursor:pointer}
 .direct button.save{background:var(--oc-primary);color:var(--oc-primary-foreground,#fff);border-color:transparent}
 .direct .error{color:var(--oc-error-text)}
+.direct .found{flex-basis:100%;display:flex;flex-wrap:wrap;align-items:center;gap:6px;color:var(--oc-muted)}
+.direct .found button{height:22px;padding:0 8px;font-size:11px}
 .direct p{flex-basis:100%;margin:2px 0 0;color:var(--oc-warning-text);font-size:11px;line-height:1.45}
 `;
 
@@ -51,7 +54,43 @@ export const createDirectEditor = ({ bar, host, toolbar, onToggle }: DirectEdito
   const error = element('span', 'error');
   error.hidden = true;
   const hint = element('p');
-  row.append(label, input, save, clear, close, error, hint);
+  /** serve-sim servers the service found on its machine; a click fills the field. */
+  const found = element('div', 'found');
+  row.append(label, input, save, clear, close, error, found, hint);
+  let t: FrameContext['t'] | null = null;
+  let search = 0;
+
+  const listServers = async () => {
+    const mine = ++search;
+    found.replaceChildren(element('span', '', t?.directSearching ?? ''));
+    let servers: ServeSimServer[] = [];
+    try {
+      const result = await host().serviceRequest({ method: 'GET', path: '/serve-sim/servers' });
+      if (result.status === 200) servers = (JSON.parse(result.body) as { servers: ServeSimServer[] }).servers;
+    } catch {
+      // the service is restarting: nothing to suggest
+    }
+    if (mine !== search || !t) return;
+    if (servers.length === 0) {
+      found.replaceChildren(element('span', '', t.directNoneFound));
+    } else {
+      const words = t;
+      found.replaceChildren(
+        element('span', '', words.directFound),
+        ...servers.map((server) => {
+          const pick = button('');
+          const device = server.name ? `, ${server.name}` : '';
+          pick.textContent = `${server.url}${device}${server.loopback ? ` (${words.directLocalOnly})` : ''}`;
+          pick.addEventListener('click', () => {
+            input.value = server.url;
+            input.focus();
+          });
+          return pick;
+        }),
+      );
+    }
+    onToggle?.(true);
+  };
   bar.after(row);
 
   const edit = button('ib');
@@ -64,7 +103,8 @@ export const createDirectEditor = ({ bar, host, toolbar, onToggle }: DirectEdito
     if (visible) {
       input.value = toolbar().directUrl() ?? '';
       input.focus();
-    }
+      void listServers();
+    } else search += 1;
     onToggle?.(visible);
   };
   const store = () => {
@@ -95,15 +135,16 @@ export const createDirectEditor = ({ bar, host, toolbar, onToggle }: DirectEdito
   return {
     show,
     visible: () => row.hidden === false,
-    label(t: FrameContext['t']) {
-      edit.setAttribute('aria-label', t.directEdit);
-      label.textContent = t.directLabel;
-      input.placeholder = t.directPlaceholder;
-      save.textContent = t.directSave;
-      clear.textContent = t.directClear;
-      close.textContent = t.directClose;
-      error.textContent = t.directInvalid;
-      hint.textContent = t.directHint;
+    label(words: FrameContext['t']) {
+      t = words;
+      edit.setAttribute('aria-label', words.directEdit);
+      label.textContent = words.directLabel;
+      input.placeholder = words.directPlaceholder;
+      save.textContent = words.directSave;
+      clear.textContent = words.directClear;
+      close.textContent = words.directClose;
+      error.textContent = words.directInvalid;
+      hint.textContent = words.directHint;
     },
   };
 };

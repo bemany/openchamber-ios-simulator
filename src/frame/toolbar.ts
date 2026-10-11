@@ -18,6 +18,8 @@ select:focus-visible,.ib:focus-visible{outline:2px solid var(--oc-focus);outline
 .ib.on{color:var(--oc-success-text)}
 .ib[aria-pressed="true"]{background:var(--oc-active)}
 .ib.pending{opacity:.6;cursor:progress}
+.ib.down{position:relative}
+.ib.down::after{content:'';position:absolute;top:4px;right:4px;width:7px;height:7px;border-radius:50%;background:var(--oc-error-text)}
 .ib.armed{color:var(--oc-warning-text);background:var(--oc-hover)}
 .ib.q{width:auto;padding:0 6px;font-size:11px;font-variant-numeric:tabular-nums}
 .sep{width:1px;height:18px;background:var(--oc-border);margin:0 2px;flex:none}
@@ -36,6 +38,8 @@ const FRAMED_KEY = 'framed';
 const QUALITY_KEY = 'quality';
 /** How long the repair button waits for its second click. */
 const REPAIR_ARMED_MS = 4_000;
+/** How often the stored serve-sim address is checked while the toolbar is visible. */
+const DIRECT_CHECK_MS = 15_000;
 const QUALITY_LABEL: Record<Quality, string> = { full: '1:1', balanced: '1:2', fast: '1:3' };
 const nextQuality = (quality: Quality): Quality => QUALITIES[(QUALITIES.indexOf(quality) + 1) % QUALITIES.length]!;
 
@@ -70,6 +74,9 @@ export const createToolbar = (bar: HTMLElement, host: () => HostClient, options:
   /** serve-sim's own interface in a tab of its own, at the address the user stored. */
   const open = iconButton('external');
   let directUrl: string | null = null;
+  /** Whether serve-sim answers at the stored address; `null` while unknown. */
+  let directRunning: boolean | null = null;
+  let directChecked = '';
   /** Picture size; cycles full, half, third. */
   const quality = element('button', 'ib q');
   quality.type = 'button';
@@ -197,6 +204,7 @@ export const createToolbar = (bar: HTMLElement, host: () => HostClient, options:
     void (async () => {
       const [framed, stored, udid, url] = await Promise.all([read(FRAMED_KEY), read(QUALITY_KEY), read(DEVICE_KEY), read(DIRECT_URL_KEY)]);
       directUrl = normalizeDirectUrl(url);
+      void checkDirect();
       if (typeof framed === 'boolean' && framed !== current()?.framed) await context?.act('/frame', { on: framed });
       const value = QUALITIES.find((candidate) => candidate === stored);
       if (value && value !== current()?.quality) await context?.act('/quality', { value });
@@ -278,7 +286,9 @@ export const createToolbar = (bar: HTMLElement, host: () => HostClient, options:
     frame.disabled = pending === '/frame';
     frame.setAttribute('aria-pressed', String(state.framed));
     label(frame, state.framed ? t.frameHide : t.frameShow);
-    label(open, directUrl ? `${t.openDirect}: ${directUrl}` : t.openDirect);
+    const down = directUrl !== null && directRunning === false;
+    open.classList.toggle('down', down);
+    label(open, directUrl ? (down ? t.directDown(directUrl) : `${t.openDirect}: ${directUrl}`) : t.openDirect);
     quality.textContent = QUALITY_LABEL[state.quality];
     quality.disabled = pending === '/quality';
     label(quality, t.qualityNext(t.quality[state.quality], t.quality[nextQuality(state.quality)]));
@@ -304,11 +314,35 @@ export const createToolbar = (bar: HTMLElement, host: () => HostClient, options:
     }
   };
 
+  /** Asks the service whether the stored address answers; runs on change and every 15 s while the frame is visible. */
+  const checkDirect = async () => {
+    const url = directUrl;
+    if (!url || document.visibilityState !== 'visible') return;
+    let running: boolean | null = null;
+    try {
+      const result = await host().serviceRequest({ method: 'GET', path: '/serve-sim/check', query: { url } });
+      if (result.status === 200) running = (JSON.parse(result.body) as { running: boolean | null }).running;
+    } catch {
+      // the service is restarting: keep the last answer
+      return;
+    }
+    if (url !== directUrl) return;
+    directChecked = url;
+    if (running !== directRunning) {
+      directRunning = running;
+      if (context) render(context);
+    }
+  };
+  setInterval(() => void checkDirect(), DIRECT_CHECK_MS);
+  document.addEventListener('visibilitychange', () => void checkDirect());
+
   return Object.assign(render, {
     /** The address saved on the page, or `null` after removing it. */
     setDirectUrl(url: string | null) {
+      if (url !== directUrl) directRunning = null;
       directUrl = url;
       if (context) render(context);
+      if (url && url !== directChecked) void checkDirect();
     },
     directUrl: () => directUrl,
   });

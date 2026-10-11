@@ -1408,15 +1408,154 @@ var createPresenter = (deps) => {
   };
 };
 
+// src/service/serve-sim-servers.ts
+import { readdirSync, readFileSync as readFileSync2 } from "node:fs";
+import { networkInterfaces, tmpdir as tmpdir4 } from "node:os";
+import { join as join5 } from "node:path";
+
+// src/shared/direct.ts
+var normalizeDirectUrl = (input) => {
+  if (typeof input !== "string")
+    return null;
+  const text = input.trim();
+  if (!text)
+    return null;
+  let url;
+  try {
+    url = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(text) ? text : `http://${text}`);
+  } catch {
+    return null;
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:")
+    return null;
+  if (!url.hostname || url.username || url.password || url.search || url.hash)
+    return null;
+  return `${url.origin}${url.pathname.replace(/\/+$/, "")}`;
+};
+
+// src/service/serve-sim-servers.ts
+var PREVIEW_PORTS = Array.from({ length: 10 }, (_, index) => 3200 + index);
+var OWN_HELPER_PORTS = { first: 3100, last: 3109 };
+var PROBE_TIMEOUT_MS = 3000;
+var PAGE_TIMEOUT_MS = 8000;
+var PREVIEW_MARKER = "window.__SIM_PREVIEW__=";
+var PAGE_READ_MAX = 1024 * 1024;
+var isLoopbackHost = (host) => host === "localhost" || host === "[::1]" || host === "::1" || host.startsWith("127.");
+var ownHelper = (url) => {
+  const port = Number(url.port);
+  return isLoopbackHost(url.hostname) && port >= OWN_HELPER_PORTS.first && port <= OWN_HELPER_PORTS.last;
+};
+var candidateUrls = (stateFileUrls, addresses) => {
+  const urls = new Set;
+  for (const raw of stateFileUrls) {
+    const url = normalizeDirectUrl(raw);
+    if (url && !ownHelper(new URL(url)))
+      urls.add(url);
+  }
+  for (const address of addresses)
+    for (const port of PREVIEW_PORTS)
+      urls.add(`http://${address}:${port}`);
+  const loopback = (url) => isLoopbackHost(new URL(url).hostname);
+  return [...urls].sort((a, b) => Number(loopback(a)) - Number(loopback(b)));
+};
+var answers = async (url, booted, probe) => (await Promise.all(booted.map((device) => probe(url, device.udid)))).some(Boolean);
+var findServers = async (deps) => {
+  const booted = await deps.booted();
+  if (booted.length === 0)
+    return [];
+  const urls = candidateUrls(deps.stateFileUrls(), deps.addresses());
+  const alive = (await Promise.all(urls.map(async (url) => await answers(url, booted, deps.probe) ? url : null))).filter((url) => url !== null);
+  return Promise.all(alive.map(async (url) => {
+    const udid = await deps.pageDevice(url);
+    const name = booted.find((device) => device.udid === udid)?.name ?? "";
+    return { url, udid: udid ?? "", name, loopback: isLoopbackHost(new URL(url).hostname) };
+  }));
+};
+var checkServer = async (raw, deps) => {
+  const url = normalizeDirectUrl(raw);
+  if (!url)
+    return null;
+  const booted = await deps.booted();
+  return booted.length === 0 ? null : answers(url, booted, deps.probe);
+};
+var previewDevice = (html) => {
+  const at = html.indexOf(PREVIEW_MARKER);
+  if (at < 0)
+    return null;
+  return /"device":"([0-9A-Fa-f-]{36})"/.exec(html.slice(at, at + 400))?.[1] ?? null;
+};
+var stateFileUrls = (dir = join5(tmpdir4(), "serve-sim")) => {
+  let names = [];
+  try {
+    names = readdirSync(dir).filter((name) => name.startsWith("server-") && name.endsWith(".json"));
+  } catch {
+    return [];
+  }
+  return names.flatMap((name) => {
+    try {
+      const state = JSON.parse(readFileSync2(join5(dir, name), "utf8"));
+      return typeof state.url === "string" ? [state.url] : [];
+    } catch {
+      return [];
+    }
+  });
+};
+var ipv4Addresses = () => Object.values(networkInterfaces()).flatMap((entries) => (entries ?? []).filter((entry) => entry.family === "IPv4").map((entry) => entry.address));
+var pagePreviewDevice = async (base) => {
+  try {
+    const response = await fetch(`${base}/`, { signal: AbortSignal.timeout(PAGE_TIMEOUT_MS), redirect: "error" });
+    if (!response.ok || !response.body)
+      return null;
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder;
+    let html = "";
+    try {
+      while (html.length < PAGE_READ_MAX) {
+        const { done, value } = await reader.read();
+        if (done)
+          break;
+        html += decoder.decode(value, { stream: true });
+        const at = html.indexOf(PREVIEW_MARKER);
+        if (at >= 0 && html.length > at + 400)
+          break;
+      }
+    } finally {
+      reader.cancel().catch(() => {
+        return;
+      });
+    }
+    return previewDevice(html);
+  } catch {
+    return null;
+  }
+};
+var probeHealth = async (base, udid) => {
+  try {
+    const response = await fetch(`${base}/helper/${encodeURIComponent(udid)}/health`, { signal: AbortSignal.timeout(PROBE_TIMEOUT_MS), redirect: "error" });
+    if (!response.ok)
+      return false;
+    return (await response.json()).status === "ok";
+  } catch {
+    return false;
+  }
+};
+var serverDeps = (booted) => ({
+  stateFileUrls: () => stateFileUrls(),
+  addresses: ipv4Addresses,
+  booted,
+  probe: probeHealth,
+  pageDevice: pagePreviewDevice
+});
+
 // src/service/simulator.ts
 import http from "node:http";
 
 // src/service/helper.ts
 import { spawn } from "node:child_process";
-import { existsSync as existsSync2, openSync, closeSync, readdirSync, readFileSync as readFileSync2 } from "node:fs";
+import { existsSync as existsSync2, openSync, closeSync, readdirSync as readdirSync2, readFileSync as readFileSync3 } from "node:fs";
 import { createServer } from "node:net";
-import { tmpdir as tmpdir4 } from "node:os";
-import { join as join5 } from "node:path";
+import { tmpdir as tmpdir5 } from "node:os";
+import { join as join6 } from "node:path";
 var LOOPBACK = "127.0.0.1";
 var FIRST_PORT = 3100;
 var PORT_SPAN = 10;
@@ -1429,17 +1568,17 @@ var isLoopbackUrl = (url) => {
     return false;
   }
 };
-var helpersFromStateFiles = (dir = join5(tmpdir4(), "serve-sim")) => {
+var helpersFromStateFiles = (dir = join6(tmpdir5(), "serve-sim")) => {
   const helpers = [];
   let names = [];
   try {
-    names = readdirSync(dir).filter((name) => name.startsWith("server-") && name.endsWith(".json"));
+    names = readdirSync2(dir).filter((name) => name.startsWith("server-") && name.endsWith(".json"));
   } catch {
     return helpers;
   }
   for (const name of names) {
     try {
-      const state = JSON.parse(readFileSync2(join5(dir, name), "utf8"));
+      const state = JSON.parse(readFileSync3(join6(dir, name), "utf8"));
       if (typeof state.url !== "string" || !isLoopbackUrl(state.url) || typeof state.port !== "number" || typeof state.device !== "string")
         continue;
       helpers.push({ port: state.port, device: state.device, ...typeof state.pid === "number" ? { pid: state.pid } : {} });
@@ -1475,7 +1614,7 @@ var portFree = (port) => new Promise((resolve) => {
 var serveSimBinary = () => SERVE_SIM.find((candidate) => !candidate.startsWith("/") || existsSync2(candidate)) ?? "serve-sim";
 var sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 var launchServeSim = (udid, port, onExit) => {
-  const log = openSync(join5(tmpdir4(), "openchamber-ios-simulator-serve-sim.log"), "a");
+  const log = openSync(join6(tmpdir5(), "openchamber-ios-simulator-serve-sim.log"), "a");
   const child = spawn(serveSimBinary(), [udid, "--port", String(port), "--host", LOOPBACK, "--exit-on-simulator-shutdown"], { detached: true, stdio: ["ignore", log, log], env: childEnv() });
   closeSync(log);
   child.once("exit", onExit);
@@ -2088,6 +2227,9 @@ var createSimulator = () => {
     setFramed(on) {
       framed = on;
     },
+    async booted() {
+      return (await refreshDevices()).filter((device) => device.state === "Booted");
+    },
     active: () => activeDevice(),
     async button(name) {
       await sendRaw(OPCODE.button, name === "home" ? { button: "home" } : { button: "power", page: 12, usage: 48 });
@@ -2161,6 +2303,7 @@ var ORIENTATIONS = ["portrait", "portrait_upside_down", "landscape_left", "lands
 var PAGE_WAIT_MS = 1e4;
 var DEFAULT_BACKGROUND = [29, 27, 27];
 var sim = createSimulator();
+var servers = serverDeps(() => sim.booted());
 var pasteboard = createPasteboard((args, options) => run(XCRUN, args, options));
 var surfaceInput = { touching: false };
 var pageInput = { touching: false };
@@ -2437,6 +2580,8 @@ var routes = {
     await sim.rotate(ORIENTATIONS.find((value) => value === body.orientation));
     send(res, 200, await sim.state());
   },
+  "GET /serve-sim/servers": async (_req, res) => send(res, 200, { servers: await findServers(servers) }),
+  "GET /serve-sim/check": async (_req, res, url) => send(res, 200, { running: await checkServer(url.searchParams.get("url"), servers) }),
   "POST /repair-input": async (_req, res) => {
     await sim.repairInput();
     send(res, 200, await sim.state());

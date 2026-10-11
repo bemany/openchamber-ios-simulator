@@ -21,6 +21,7 @@ import { run, XCRUN } from './exec.ts';
 import { translateInput, type InputState } from './input.ts';
 import { createPasteboard, sendInput } from './paste.ts';
 import { createPresenter, sameView } from './present.ts';
+import { checkServer, findServers, serverDeps } from './serve-sim-servers.ts';
 import { rotationFor } from './rotate.ts';
 import { screenshot } from './simctl.ts';
 import { createSimulator } from './simulator.ts';
@@ -43,6 +44,7 @@ const PAGE_WAIT_MS = 10_000;
 const DEFAULT_BACKGROUND: [number, number, number] = [0x1d, 0x1b, 0x1b];
 
 const sim = createSimulator();
+const servers = serverDeps(() => sim.booted());
 const pasteboard = createPasteboard((args, options) => run(XCRUN, args, options));
 const surfaceInput: InputState = { touching: false };
 const pageInput: InputState = { touching: false };
@@ -327,6 +329,9 @@ const routes: Record<string, Route> = {
     await sim.rotate(ORIENTATIONS.find((value) => value === body.orientation));
     send(res, 200, await sim.state());
   },
+  // For the "Open in serve-sim" address: preview servers on this machine, and whether the stored address answers.
+  'GET /serve-sim/servers': async (_req, res) => send(res, 200, { servers: await findServers(servers) }),
+  'GET /serve-sim/check': async (_req, res, url) => send(res, 200, { running: await checkServer(url.searchParams.get('url'), servers) }),
   'POST /repair-input': async (_req, res) => {
     await sim.repairInput();
     send(res, 200, await sim.state());

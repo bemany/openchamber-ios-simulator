@@ -410,6 +410,11 @@ export const createSimulator = () => {
       framed = on;
     },
 
+    /** Booted devices, from a device list at most one poll old. */
+    async booted(): Promise<Device[]> {
+      return (await refreshDevices()).filter((device) => device.state === 'Booted');
+    },
+
     /** The device shown, from the last device list (no refresh). */
     active: (): Device | null => activeDevice(),
 
