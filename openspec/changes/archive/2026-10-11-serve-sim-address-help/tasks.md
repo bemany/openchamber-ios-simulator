@@ -13,4 +13,4 @@
 ## 3. Docs and release
 
 - [x] 3.1 README: open button section (suggestions, port range, indicator), troubleshooting row "red dot on the open button"; German section
-- [ ] 3.2 `bun run check`, `node scripts/smoke.mjs`, privacy grep, commit with `dist/`, release after the owner's go, close #10 when the change is archived
+- [x] 3.2 `bun run check`, `node scripts/smoke.mjs`, privacy grep, commit with `dist/`, release after the owner's go, close #10 when the change is archived

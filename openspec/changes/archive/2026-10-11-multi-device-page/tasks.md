@@ -21,4 +21,4 @@
 
 ## 4. Release
 
-- [ ] 4.1 `bun run check`, `node scripts/smoke.mjs`, commit with `dist/`, release after the owner's go, close #9 when the change is archived
+- [x] 4.1 `bun run check`, `node scripts/smoke.mjs`, commit with `dist/`, release after the owner's go, close #9 when the change is archived
