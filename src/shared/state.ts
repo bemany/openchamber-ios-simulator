@@ -20,8 +20,14 @@ export type Appearance = 'light' | 'dark' | 'unknown';
 /** A serve-sim stream process attached to a device (from the process list). `own`: the extension's helper. */
 export type ServeSimProcess = { pid: number; host: string; port: number; own: boolean };
 
+/** Warn only when a serve-sim the extension did not start shares the device with another. */
+export const serveSimsDoubled = (list: ServeSimProcess[]): boolean => list.length > 1 && list.some((entry) => !entry.own);
+
 /** A serve-sim preview server the service found on its machine (`GET /serve-sim/servers`). */
-export type ServeSimServer = { url: string; udid: string; name: string; loopback: boolean };
+export type ServeSimServer = { url: string; udid: string; name: string; loopback: boolean; started?: boolean };
+
+/** One of the OpenChamber machine's IPv4 addresses, for starting a preview server on it. */
+export type OwnAddress = { address: string; interface: string };
 
 export type KeyboardLayout = 'ch' | 'de' | 'es' | 'fr' | 'gb' | 'it' | 'us';
 

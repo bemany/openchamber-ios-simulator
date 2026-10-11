@@ -21,7 +21,8 @@ import { run, XCRUN } from './exec.ts';
 import { translateInput, type InputState } from './input.ts';
 import { createPasteboard, sendInput } from './paste.ts';
 import { createPresenter, sameView } from './present.ts';
-import { checkServer, findServers, serverDeps } from './serve-sim-servers.ts';
+import { createPreviews, ownAddresses, PreviewError, previewDeps } from './preview-servers.ts';
+import { checkServer, findServers, probeHealth, serverDeps } from './serve-sim-servers.ts';
 import { rotationFor } from './rotate.ts';
 import { screenshot } from './simctl.ts';
 import { createSimulator } from './simulator.ts';
@@ -43,7 +44,8 @@ const PAGE_WAIT_MS = 10_000;
 /** Behind the frame where the surface has no picture; the toolbar sends the panel's own colour. */
 const DEFAULT_BACKGROUND: [number, number, number] = [0x1d, 0x1b, 0x1b];
 
-const sim = createSimulator();
+const previews = createPreviews(previewDeps(probeHealth));
+const sim = createSimulator(() => new Set(previews.started().map((entry) => entry.pid)));
 const servers = serverDeps(() => sim.booted());
 const pasteboard = createPasteboard((args, options) => run(XCRUN, args, options));
 const surfaceInput: InputState = { touching: false };
@@ -377,7 +379,26 @@ const routes: Record<string, Route> = {
     send(res, 200, await sim.state(udid));
   },
   // For the "Open in serve-sim" address: preview servers on this machine, and whether the stored address answers.
-  'GET /serve-sim/servers': async (_req, res) => send(res, 200, { servers: await findServers(servers) }),
+  'GET /serve-sim/servers': async (_req, res) => {
+    const started = new Set(previews.started().map((entry) => entry.url));
+    send(res, 200, { servers: (await findServers(servers)).map((server) => ({ ...server, started: started.has(server.url) })) });
+  },
+  // Starting a preview server on request (the address row, after a confirmation), and stopping one the extension started.
+  'GET /serve-sim/addresses': async (_req, res) => send(res, 200, { addresses: ownAddresses() }),
+  'POST /serve-sim/start': async (req, res) => {
+    const { body, udid } = await target(req);
+    const device = udid ? sim.device(udid) : sim.active();
+    if (!device || device.state !== 'Booted') return send(res, 409, { error: 'The simulator is not booted' });
+    const entry = await previews.start(body.address, device.udid);
+    sim.forgetProcesses();
+    send(res, 200, { url: entry.url });
+  },
+  'POST /serve-sim/stop': async (req, res) => {
+    const body = await readJson(req);
+    await previews.stop(body.url, (await sim.booted()).map((device) => device.udid));
+    sim.forgetProcesses();
+    send(res, 200, { ok: true });
+  },
   'GET /serve-sim/check': async (_req, res, url) => send(res, 200, { running: await checkServer(url.searchParams.get('url'), servers) }),
   'POST /repair-input': async (req, res) => {
     const { udid } = await target(req);
@@ -431,7 +452,7 @@ const server = http.createServer((req, res) => {
       res.destroy();
       return;
     }
-    send(res, cause instanceof SyntaxError ? 400 : cause instanceof UnknownDevice ? 404 : 500, { error: cause instanceof Error ? cause.message : String(cause) });
+    send(res, cause instanceof SyntaxError ? 400 : cause instanceof UnknownDevice ? 404 : cause instanceof PreviewError ? cause.status : 500, { error: cause instanceof Error ? cause.message : String(cause) });
   });
 });
 

@@ -1408,6 +1408,13 @@ var createPresenter = (deps) => {
   };
 };
 
+// src/service/preview-servers.ts
+import { spawn } from "node:child_process";
+import { closeSync, existsSync as existsSync2, openSync, readFileSync as readFileSync3, writeFileSync } from "node:fs";
+import { createServer } from "node:net";
+import { networkInterfaces as networkInterfaces2, tmpdir as tmpdir5 } from "node:os";
+import { join as join6 } from "node:path";
+
 // src/service/serve-sim-servers.ts
 import { readdirSync, readFileSync as readFileSync2 } from "node:fs";
 import { networkInterfaces, tmpdir as tmpdir4 } from "node:os";
@@ -1547,15 +1554,235 @@ var serverDeps = (booted) => ({
   pageDevice: pagePreviewDevice
 });
 
+// src/service/preview-servers.ts
+var rank = (address) => {
+  const [a = 0, b = 0] = address.split(".").map(Number);
+  if (a === 100 && b >= 64 && b <= 127)
+    return 0;
+  if (a === 10 || a === 192 && b === 168 || a === 172 && b >= 16 && b <= 31)
+    return 1;
+  if (a === 127)
+    return 3;
+  return 2;
+};
+var ownAddresses = (interfaces = networkInterfaces2()) => Object.entries(interfaces).flatMap(([name, entries]) => (entries ?? []).filter((entry) => entry.family === "IPv4").map((entry) => ({ address: entry.address, interface: name }))).sort((left, right) => rank(left.address) - rank(right.address));
+
+class PreviewError extends Error {
+  status;
+  constructor(message, status) {
+    super(message);
+    this.status = status;
+  }
+}
+var createPreviews = (deps) => {
+  const started = () => {
+    const list = deps.readRecord();
+    const living = list.filter((entry) => deps.alive(entry.pid));
+    if (living.length !== list.length)
+      deps.writeRecord(living);
+    return living;
+  };
+  return {
+    started,
+    async start(address, udid) {
+      if (typeof address !== "string" || !deps.addresses().some((own) => own.address === address)) {
+        throw new PreviewError("Not an address of this machine", 400);
+      }
+      let port = null;
+      for (const candidate of PREVIEW_PORTS) {
+        if (await deps.portFree(address, candidate)) {
+          port = candidate;
+          break;
+        }
+      }
+      if (port === null)
+        throw new PreviewError(`No free port ${PREVIEW_PORTS[0]}-${PREVIEW_PORTS[PREVIEW_PORTS.length - 1]} on ${address}`, 409);
+      const pid = deps.launch(udid, address, port);
+      if (pid === undefined)
+        throw new PreviewError("serve-sim did not start", 500);
+      const url = `http://${address}:${port}`;
+      for (const deadline = Date.now() + deps.startTimeoutMs;Date.now() < deadline; ) {
+        await deps.sleep(500);
+        if (!deps.alive(pid))
+          break;
+        if (await deps.probe(url, udid)) {
+          const entry = { pid, url, udid };
+          deps.writeRecord([...started().filter((other) => other.url !== url), entry]);
+          return entry;
+        }
+      }
+      deps.kill(pid);
+      throw new PreviewError("serve-sim did not answer (log: $TMPDIR/openchamber-ios-simulator-serve-sim.log)", 500);
+    },
+    async stop(url, booted) {
+      const list = started();
+      const entry = list.find((candidate) => candidate.url === url);
+      if (!entry)
+        throw new PreviewError("Not a server this extension started", 404);
+      const answers = (await Promise.all(booted.map((udid) => deps.probe(entry.url, udid)))).some(Boolean);
+      if (answers)
+        deps.kill(entry.pid);
+      deps.writeRecord(list.filter((candidate) => candidate !== entry));
+    }
+  };
+};
+var RECORD = join6(tmpdir5(), "openchamber-ios-simulator-previews.json");
+var readRecord = () => {
+  try {
+    const value = JSON.parse(readFileSync3(RECORD, "utf8"));
+    return Array.isArray(value) ? value.filter((entry) => typeof entry?.pid === "number" && typeof entry?.url === "string" && typeof entry?.udid === "string") : [];
+  } catch {
+    return [];
+  }
+};
+var portFree = (address, port) => new Promise((resolve) => {
+  const server = createServer();
+  server.once("error", () => resolve(false));
+  server.listen(port, address, () => server.close(() => resolve(true)));
+});
+var launch = (udid, address, port) => {
+  const log = openSync(join6(tmpdir5(), "openchamber-ios-simulator-serve-sim.log"), "a");
+  const binary = SERVE_SIM.find((candidate) => !candidate.startsWith("/") || existsSync2(candidate)) ?? "serve-sim";
+  const child = spawn(binary, [udid, "--host", address, "--port", String(port), "--exit-on-simulator-shutdown"], { detached: true, stdio: ["ignore", log, log], env: childEnv() });
+  closeSync(log);
+  child.on("error", () => {
+    return;
+  });
+  child.unref();
+  return child.pid;
+};
+var previewDeps = (probe) => ({
+  addresses: () => ownAddresses(),
+  portFree,
+  launch,
+  probe,
+  alive: (pid) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  },
+  kill: (pid) => {
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch {}
+  },
+  readRecord,
+  writeRecord: (list) => writeFileSync(RECORD, JSON.stringify(list)),
+  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  startTimeoutMs: 30000
+});
+
 // src/service/device-link.ts
 import http from "node:http";
 
 // src/service/helper.ts
-import { spawn } from "node:child_process";
-import { existsSync as existsSync2, openSync, closeSync, readdirSync as readdirSync2, readFileSync as readFileSync3 } from "node:fs";
-import { createServer } from "node:net";
-import { tmpdir as tmpdir5 } from "node:os";
-import { join as join6 } from "node:path";
+import { spawn as spawn2 } from "node:child_process";
+import { existsSync as existsSync3, openSync as openSync2, closeSync as closeSync2, readdirSync as readdirSync2, readFileSync as readFileSync4 } from "node:fs";
+import { createServer as createServer2 } from "node:net";
+import { tmpdir as tmpdir6 } from "node:os";
+import { join as join7 } from "node:path";
+
+// src/service/serve-sim-processes.ts
+var UUID = /^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/;
+var VALUE_FLAGS = new Set(["--port", "-p", "--host", "--codec", "--panes", "--theme", "-d", "--device"]);
+var NOT_A_STREAM = new Set(["--list", "-l", "--kill", "-k", "--help", "-h", "--version", "-v"]);
+var DEFAULT_PORT = 3200;
+var DEFAULT_HOST = "127.0.0.1";
+var OWN_PORTS = { first: 3100, last: 3109 };
+var serveSimArgs = (command) => {
+  const tokens = command.trim().split(/\s+/);
+  const isServeSim = (token = "") => token === "serve-sim" || token.endsWith("/serve-sim");
+  if (isServeSim(tokens[0]))
+    return tokens.slice(1);
+  if (/(^|\/)node$/.test(tokens[0] ?? "") && isServeSim(tokens[1]))
+    return tokens.slice(2);
+  return null;
+};
+var parseServeSimProcesses = (output) => {
+  const found = [];
+  for (const line of output.split(`
+`)) {
+    const match = /^\s*(\d+)\s+(.*)$/.exec(line);
+    if (!match)
+      continue;
+    const args = serveSimArgs(match[2]);
+    if (!args)
+      continue;
+    let host = DEFAULT_HOST;
+    let port = DEFAULT_PORT;
+    let exitsWithSimulator = false;
+    let stream = true;
+    const devices = [];
+    for (let index = 0;index < args.length; index += 1) {
+      const token = args[index];
+      if (NOT_A_STREAM.has(token)) {
+        stream = false;
+        break;
+      }
+      if (VALUE_FLAGS.has(token)) {
+        const value = args[index += 1] ?? "";
+        if (token === "--host")
+          host = value;
+        if (token === "--port" || token === "-p")
+          port = Number(value) || DEFAULT_PORT;
+        continue;
+      }
+      if (token.startsWith("--host="))
+        host = token.slice("--host=".length);
+      else if (token.startsWith("--port="))
+        port = Number(token.slice("--port=".length)) || DEFAULT_PORT;
+      else if (token === "--exit-on-simulator-shutdown")
+        exitsWithSimulator = true;
+      else if (UUID.test(token))
+        devices.push(token.toUpperCase());
+      else if (!token.startsWith("-")) {
+        if (devices.length === 0 && index === 0) {
+          stream = false;
+          break;
+        }
+      }
+    }
+    if (!stream)
+      continue;
+    const own = host === "127.0.0.1" && port >= OWN_PORTS.first && port <= OWN_PORTS.last && exitsWithSimulator;
+    found.push({ pid: Number(match[1]), host, port, own, devices });
+  }
+  return found;
+};
+var processesFor = (all, udid, booted, ownPids = new Set) => booted ? all.filter((entry) => entry.devices.length === 0 ? true : entry.devices.includes(udid.toUpperCase())).map(({ pid, host, port, own }) => ({ pid, host, port, own: own || ownPids.has(pid) })) : [];
+var CACHE_MS = 5000;
+var PS = ["/bin/ps", "ps"];
+var createProcessReader = (read = async () => {
+  const result = await run(PS, ["-axo", "pid=,command="], { timeout: 5000 });
+  return result.ok ? result.stdout : null;
+}) => {
+  let cached = null;
+  let pending = null;
+  const reader = async () => {
+    if (cached && Date.now() - cached.at < CACHE_MS)
+      return cached.list;
+    pending ??= (async () => {
+      const output = await read().catch(() => null);
+      const list = output === null ? [] : parseServeSimProcesses(output);
+      cached = { at: Date.now(), list };
+      return list;
+    })().finally(() => {
+      pending = null;
+    });
+    return pending;
+  };
+  return Object.assign(reader, {
+    forget() {
+      cached = null;
+    }
+  });
+};
+
+// src/service/helper.ts
+var helperProcesses = createProcessReader();
 var LOOPBACK = "127.0.0.1";
 var FIRST_PORT = 3100;
 var PORT_SPAN = 10;
@@ -1568,7 +1795,7 @@ var isLoopbackUrl = (url) => {
     return false;
   }
 };
-var helpersFromStateFiles = (dir = join6(tmpdir5(), "serve-sim")) => {
+var helpersFromStateFiles = (dir = join7(tmpdir6(), "serve-sim")) => {
   const helpers = [];
   let names = [];
   try {
@@ -1578,7 +1805,7 @@ var helpersFromStateFiles = (dir = join6(tmpdir5(), "serve-sim")) => {
   }
   for (const name of names) {
     try {
-      const state = JSON.parse(readFileSync3(join6(dir, name), "utf8"));
+      const state = JSON.parse(readFileSync4(join7(dir, name), "utf8"));
       if (typeof state.url !== "string" || !isLoopbackUrl(state.url) || typeof state.port !== "number" || typeof state.device !== "string")
         continue;
       helpers.push({ port: state.port, device: state.device, ...typeof state.pid === "number" ? { pid: state.pid } : {} });
@@ -1606,17 +1833,17 @@ var probe = async (port, udid) => {
     return false;
   }
 };
-var portFree = (port) => new Promise((resolve) => {
-  const server = createServer();
+var portFree2 = (port) => new Promise((resolve) => {
+  const server = createServer2();
   server.once("error", () => resolve(false));
   server.listen(port, LOOPBACK, () => server.close(() => resolve(true)));
 });
-var serveSimBinary = () => SERVE_SIM.find((candidate) => !candidate.startsWith("/") || existsSync2(candidate)) ?? "serve-sim";
+var serveSimBinary = () => SERVE_SIM.find((candidate) => !candidate.startsWith("/") || existsSync3(candidate)) ?? "serve-sim";
 var sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 var launchServeSim = (udid, port, onExit) => {
-  const log = openSync(join6(tmpdir5(), "openchamber-ios-simulator-serve-sim.log"), "a");
-  const child = spawn(serveSimBinary(), [udid, "--port", String(port), "--host", LOOPBACK, "--exit-on-simulator-shutdown"], { detached: true, stdio: ["ignore", log, log], env: childEnv() });
-  closeSync(log);
+  const log = openSync2(join7(tmpdir6(), "openchamber-ios-simulator-serve-sim.log"), "a");
+  const child = spawn2(serveSimBinary(), [udid, "--port", String(port), "--host", LOOPBACK, "--exit-on-simulator-shutdown"], { detached: true, stdio: ["ignore", log, log], env: childEnv() });
+  closeSync2(log);
   child.once("exit", onExit);
   child.once("error", onExit);
   child.unref();
@@ -1666,7 +1893,7 @@ var createHelpers = (deps) => {
     }
   };
   const ensure = async (udid, remembered) => {
-    for (const port of candidatePorts(udid, remembered, started, deps.recorded())) {
+    for (const port of candidatePorts(udid, remembered, started, await deps.recorded())) {
       if (await deps.probe(port, udid))
         return port;
     }
@@ -1685,7 +1912,7 @@ var createHelpers = (deps) => {
     for (const [port, device] of started)
       if (device === udid)
         targets.set(port, pids.get(port));
-    for (const entry of deps.recorded()) {
+    for (const entry of await deps.recorded()) {
       if (entry.device !== udid || entry.pid === undefined || (started.get(entry.port) ?? udid) !== udid)
         continue;
       if (targets.get(entry.port) === undefined && await deps.probe(entry.port, udid))
@@ -1711,8 +1938,13 @@ var createHelpers = (deps) => {
 };
 var helpers = createHelpers({
   probe,
-  portFree,
-  recorded: () => helpersFromStateFiles(),
+  portFree: portFree2,
+  recorded: async () => {
+    const fromFiles = helpersFromStateFiles();
+    const fromProcesses = (await helperProcesses()).filter((entry) => entry.own && entry.devices.length === 1).map((entry) => ({ port: entry.port, device: entry.devices[0], pid: entry.pid }));
+    const seen = new Set(fromFiles.map((entry) => `${entry.device}:${entry.port}`));
+    return [...fromFiles, ...fromProcesses.filter((entry) => !seen.has(`${entry.device}:${entry.port}`))];
+  },
   launch: launchServeSim,
   kill: (pid) => {
     try {
@@ -2080,97 +2312,6 @@ var repairInput = async (udid, deps) => {
   return deps.restartHelper(udid);
 };
 
-// src/service/serve-sim-processes.ts
-var UUID = /^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/;
-var VALUE_FLAGS = new Set(["--port", "-p", "--host", "--codec", "--panes", "--theme", "-d", "--device"]);
-var NOT_A_STREAM = new Set(["--list", "-l", "--kill", "-k", "--help", "-h", "--version", "-v"]);
-var DEFAULT_PORT = 3200;
-var DEFAULT_HOST = "127.0.0.1";
-var OWN_PORTS = { first: 3100, last: 3109 };
-var serveSimArgs = (command) => {
-  const tokens = command.trim().split(/\s+/);
-  const isServeSim = (token = "") => token === "serve-sim" || token.endsWith("/serve-sim");
-  if (isServeSim(tokens[0]))
-    return tokens.slice(1);
-  if (/(^|\/)node$/.test(tokens[0] ?? "") && isServeSim(tokens[1]))
-    return tokens.slice(2);
-  return null;
-};
-var parseServeSimProcesses = (output) => {
-  const found = [];
-  for (const line of output.split(`
-`)) {
-    const match = /^\s*(\d+)\s+(.*)$/.exec(line);
-    if (!match)
-      continue;
-    const args = serveSimArgs(match[2]);
-    if (!args)
-      continue;
-    let host = DEFAULT_HOST;
-    let port = DEFAULT_PORT;
-    let exitsWithSimulator = false;
-    let stream = true;
-    const devices = [];
-    for (let index = 0;index < args.length; index += 1) {
-      const token = args[index];
-      if (NOT_A_STREAM.has(token)) {
-        stream = false;
-        break;
-      }
-      if (VALUE_FLAGS.has(token)) {
-        const value = args[index += 1] ?? "";
-        if (token === "--host")
-          host = value;
-        if (token === "--port" || token === "-p")
-          port = Number(value) || DEFAULT_PORT;
-        continue;
-      }
-      if (token.startsWith("--host="))
-        host = token.slice("--host=".length);
-      else if (token.startsWith("--port="))
-        port = Number(token.slice("--port=".length)) || DEFAULT_PORT;
-      else if (token === "--exit-on-simulator-shutdown")
-        exitsWithSimulator = true;
-      else if (UUID.test(token))
-        devices.push(token.toUpperCase());
-      else if (!token.startsWith("-")) {
-        if (devices.length === 0 && index === 0) {
-          stream = false;
-          break;
-        }
-      }
-    }
-    if (!stream)
-      continue;
-    const own = host === "127.0.0.1" && port >= OWN_PORTS.first && port <= OWN_PORTS.last && exitsWithSimulator;
-    found.push({ pid: Number(match[1]), host, port, own, devices });
-  }
-  return found;
-};
-var processesFor = (all, udid, booted) => booted ? all.filter((entry) => entry.devices.length === 0 ? true : entry.devices.includes(udid.toUpperCase())).map(({ pid, host, port, own }) => ({ pid, host, port, own })) : [];
-var CACHE_MS = 5000;
-var PS = ["/bin/ps", "ps"];
-var createProcessReader = (read = async () => {
-  const result = await run(PS, ["-axo", "pid=,command="], { timeout: 5000 });
-  return result.ok ? result.stdout : null;
-}) => {
-  let cached = null;
-  let pending = null;
-  return async () => {
-    if (cached && Date.now() - cached.at < CACHE_MS)
-      return cached.list;
-    pending ??= (async () => {
-      const output = await read().catch(() => null);
-      const list = output === null ? [] : parseServeSimProcesses(output);
-      cached = { at: Date.now(), list };
-      return list;
-    })().finally(() => {
-      pending = null;
-    });
-    return pending;
-  };
-};
-
 // src/service/simulator.ts
 var VIEWER_GRACE_MS2 = 35000;
 var DEVICE_POLL_MS = 2000;
@@ -2179,7 +2320,7 @@ var SKIPPED_SHOWN_MS = 8000;
 var PLACEHOLDER = { width: 402, height: 874, color: 1907483 };
 var sleep3 = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 var message2 = (cause) => cause instanceof Error ? cause.message : String(cause);
-var createSimulator = () => {
+var createSimulator = (ownPreviewPids = () => new Set) => {
   const hub = createFrameHub();
   let devices = [];
   let devicesAt = 0;
@@ -2381,7 +2522,7 @@ var createSimulator = () => {
         framed,
         quality,
         skipped: Date.now() - skipped.at < SKIPPED_SHOWN_MS ? skipped.count : 0,
-        serveSims: active ? processesFor(await serveSimProcesses(), active.udid, true) : [],
+        serveSims: active ? processesFor(await serveSimProcesses(), active.udid, true, ownPreviewPids()) : [],
         error
       };
     },
@@ -2509,6 +2650,9 @@ var createSimulator = () => {
       const target = udid ?? activeDevice()?.udid;
       return target ? layoutOf(target) : "us";
     },
+    forgetProcesses() {
+      serveSimProcesses.forget();
+    },
     setController(next) {
       controller = next;
     },
@@ -2530,7 +2674,8 @@ var COPY_SETTLE_MS = 150;
 var ORIENTATIONS = ["portrait", "portrait_upside_down", "landscape_left", "landscape_right"];
 var PAGE_WAIT_MS = 1e4;
 var DEFAULT_BACKGROUND = [29, 27, 27];
-var sim = createSimulator();
+var previews = createPreviews(previewDeps(probeHealth));
+var sim = createSimulator(() => new Set(previews.started().map((entry) => entry.pid)));
 var servers = serverDeps(() => sim.booted());
 var pasteboard = createPasteboard((args, options) => run(XCRUN, args, options));
 var surfaceInput = { touching: false };
@@ -2853,7 +2998,26 @@ var routes = {
     await sim.rotate(ORIENTATIONS.find((value) => value === body.orientation), udid);
     send(res, 200, await sim.state(udid));
   },
-  "GET /serve-sim/servers": async (_req, res) => send(res, 200, { servers: await findServers(servers) }),
+  "GET /serve-sim/servers": async (_req, res) => {
+    const started = new Set(previews.started().map((entry) => entry.url));
+    send(res, 200, { servers: (await findServers(servers)).map((server) => ({ ...server, started: started.has(server.url) })) });
+  },
+  "GET /serve-sim/addresses": async (_req, res) => send(res, 200, { addresses: ownAddresses() }),
+  "POST /serve-sim/start": async (req, res) => {
+    const { body, udid } = await target(req);
+    const device = udid ? sim.device(udid) : sim.active();
+    if (!device || device.state !== "Booted")
+      return send(res, 409, { error: "The simulator is not booted" });
+    const entry = await previews.start(body.address, device.udid);
+    sim.forgetProcesses();
+    send(res, 200, { url: entry.url });
+  },
+  "POST /serve-sim/stop": async (req, res) => {
+    const body = await readJson(req);
+    await previews.stop(body.url, (await sim.booted()).map((device) => device.udid));
+    sim.forgetProcesses();
+    send(res, 200, { ok: true });
+  },
   "GET /serve-sim/check": async (_req, res, url) => send(res, 200, { running: await checkServer(url.searchParams.get("url"), servers) }),
   "POST /repair-input": async (req, res) => {
     const { udid } = await target(req);
@@ -2907,7 +3071,7 @@ var server = http2.createServer((req, res) => {
       res.destroy();
       return;
     }
-    send(res, cause instanceof SyntaxError ? 400 : cause instanceof UnknownDevice ? 404 : 500, { error: cause instanceof Error ? cause.message : String(cause) });
+    send(res, cause instanceof SyntaxError ? 400 : cause instanceof UnknownDevice ? 404 : cause instanceof PreviewError ? cause.status : 500, { error: cause instanceof Error ? cause.message : String(cause) });
   });
 });
 var shutdown = () => {

@@ -12,6 +12,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { childEnv, SERVE_SIM } from './exec.ts';
+import { createProcessReader } from './serve-sim-processes.ts';
+
+const helperProcesses = createProcessReader();
 
 export const LOOPBACK = '127.0.0.1';
 const FIRST_PORT = 3100;
@@ -95,7 +98,8 @@ export type HelperDeps = {
   /** Does a serve-sim helper on `port` answer for `udid`? */
   probe: (port: number, udid: string) => Promise<boolean>;
   portFree: (port: number) => Promise<boolean>;
-  recorded: () => HelperEntry[];
+  /** Helpers known from outside this service: serve-sim's state files and the process list. */
+  recorded: () => HelperEntry[] | Promise<HelperEntry[]>;
   /** Starts `serve-sim <udid>` on `port`; `onExit` runs when that process ends. Answers its pid. */
   launch: (udid: string, port: number, onExit: () => void) => number | undefined;
   /** Asks a helper process to end. */
@@ -168,7 +172,7 @@ export const createHelpers = (deps: HelperDeps) => {
 
   /** Port of the loopback helper that belongs to `udid`. Starts one when none runs. */
   const ensure = async (udid: string, remembered: number | null): Promise<number> => {
-    for (const port of candidatePorts(udid, remembered, started, deps.recorded())) {
+    for (const port of candidatePorts(udid, remembered, started, await deps.recorded())) {
       if (await deps.probe(port, udid)) return port;
     }
     let pending = starting.get(udid);
@@ -189,7 +193,7 @@ export const createHelpers = (deps: HelperDeps) => {
     await starting.get(udid)?.catch(() => undefined);
     const targets = new Map<number, number | undefined>();
     for (const [port, device] of started) if (device === udid) targets.set(port, pids.get(port));
-    for (const entry of deps.recorded()) {
+    for (const entry of await deps.recorded()) {
       if (entry.device !== udid || entry.pid === undefined || (started.get(entry.port) ?? udid) !== udid) continue;
       // A recorded pid counts only while its port still answers for this device (pids get reused).
       if (targets.get(entry.port) === undefined && (await deps.probe(entry.port, udid))) targets.set(entry.port, entry.pid);
@@ -215,7 +219,15 @@ export const createHelpers = (deps: HelperDeps) => {
 const helpers = createHelpers({
   probe,
   portFree,
-  recorded: () => helpersFromStateFiles(),
+  // A preview server for the same device overwrites the state file: the process list still knows the helper.
+  recorded: async () => {
+    const fromFiles = helpersFromStateFiles();
+    const fromProcesses = (await helperProcesses())
+      .filter((entry) => entry.own && entry.devices.length === 1)
+      .map((entry) => ({ port: entry.port, device: entry.devices[0]!, pid: entry.pid }));
+    const seen = new Set(fromFiles.map((entry) => `${entry.device}:${entry.port}`));
+    return [...fromFiles, ...fromProcesses.filter((entry) => !seen.has(`${entry.device}:${entry.port}`))];
+  },
   launch: launchServeSim,
   kill: (pid) => {
     try {

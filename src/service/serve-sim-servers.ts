@@ -135,7 +135,8 @@ const pagePreviewDevice = async (base: string): Promise<string | null> => {
   }
 };
 
-const probeHealth = async (base: string, udid: string): Promise<boolean> => {
+/** Does serve-sim at `base` answer its helper health route for `udid`? */
+export const probeHealth = async (base: string, udid: string): Promise<boolean> => {
   try {
     const response = await fetch(`${base}/helper/${encodeURIComponent(udid)}/health`, { signal: AbortSignal.timeout(PROBE_TIMEOUT_MS), redirect: 'error' });
     if (!response.ok) return false;

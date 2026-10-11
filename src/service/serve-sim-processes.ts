@@ -73,12 +73,15 @@ export const parseServeSimProcesses = (output: string): ParsedServeSim[] => {
   return found;
 };
 
-/** The processes attached to `udid`; one without a device counts for every booted device. */
-export const processesFor = (all: ParsedServeSim[], udid: string, booted: boolean): ServeSimProcess[] =>
+/**
+ * The processes attached to `udid`; one without a device counts for every
+ * booted device. `ownPids`: preview servers the extension started on request, which count as its own.
+ */
+export const processesFor = (all: ParsedServeSim[], udid: string, booted: boolean, ownPids: ReadonlySet<number> = new Set()): ServeSimProcess[] =>
   booted
     ? all
         .filter((entry) => (entry.devices.length === 0 ? true : entry.devices.includes(udid.toUpperCase())))
-        .map(({ pid, host, port, own }) => ({ pid, host, port, own }))
+        .map(({ pid, host, port, own }) => ({ pid, host, port, own: own || ownPids.has(pid) }))
     : [];
 
 const CACHE_MS = 5_000;
@@ -91,7 +94,7 @@ export const createProcessReader = (read: () => Promise<string | null> = async (
 }) => {
   let cached: { at: number; list: ParsedServeSim[] } | null = null;
   let pending: Promise<ParsedServeSim[]> | null = null;
-  return async (): Promise<ParsedServeSim[]> => {
+  const reader = async (): Promise<ParsedServeSim[]> => {
     if (cached && Date.now() - cached.at < CACHE_MS) return cached.list;
     pending ??= (async () => {
       const output = await read().catch(() => null);
@@ -103,4 +106,10 @@ export const createProcessReader = (read: () => Promise<string | null> = async (
     });
     return pending;
   };
+  /** Reads afresh next time (after the extension started or stopped a server). */
+  return Object.assign(reader, {
+    forget() {
+      cached = null;
+    },
+  });
 };

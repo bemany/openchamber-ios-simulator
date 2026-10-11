@@ -19,8 +19,10 @@ context: |
   frames or connections). serviceRequest answers are cut at 256 000 characters.
 
   Rules that every change keeps:
-  - serve-sim is only ever bound to 127.0.0.1; never start or reuse a serve-sim
-    server on another interface (its page carries a shell-route token).
+  - The extension's own serve-sim helpers are only ever bound to 127.0.0.1. A
+    serve-sim preview server on another address (its page carries a
+    shell-route token) is started only on the user's explicit, confirmed
+    request from the address row, never by itself, never reused as a helper.
   - Never boot a simulator unasked; several simulators may run at once.
   - Never ship Apple artwork; the device frame is read from the local Xcode.
   - No private data (IPs, UDIDs, personal paths, private project names) in the repo.

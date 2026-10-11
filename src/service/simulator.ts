@@ -36,7 +36,8 @@ const PLACEHOLDER = { width: 402, height: 874, color: 0x1d1b1b };
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const message = (cause: unknown) => (cause instanceof Error ? cause.message : String(cause));
 
-export const createSimulator = () => {
+/** `ownPreviewPids`: preview servers the extension started on request (they count as its own). */
+export const createSimulator = (ownPreviewPids: () => ReadonlySet<number> = () => new Set()) => {
   /** The panel's pictures: the frames of the device it shows, numbered on across switches, or a placeholder. */
   const hub = createFrameHub();
   let devices: Device[] = [];
@@ -251,7 +252,7 @@ export const createSimulator = () => {
         framed,
         quality,
         skipped: Date.now() - skipped.at < SKIPPED_SHOWN_MS ? skipped.count : 0,
-        serveSims: active ? processesFor(await serveSimProcesses(), active.udid, true) : [],
+        serveSims: active ? processesFor(await serveSimProcesses(), active.udid, true, ownPreviewPids()) : [],
         error,
       };
     },
@@ -405,6 +406,11 @@ export const createSimulator = () => {
     async layout(udid?: string): Promise<KeyboardLayout> {
       const target = udid ?? activeDevice()?.udid;
       return target ? layoutOf(target) : 'us';
+    },
+
+    /** The process list changed (a preview server started or stopped): read it afresh. */
+    forgetProcesses() {
+      serveSimProcesses.forget();
     },
 
     setController(next: SimState['controller']) {

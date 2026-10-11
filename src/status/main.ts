@@ -1,5 +1,5 @@
 // Work Status section: which device runs and whether the stream is on.
-import type { SimState } from '../shared/state.ts';
+import { serveSimsDoubled, type SimState } from '../shared/state.ts';
 import { startFrame } from '../frame/host.ts';
 import type { Messages } from '../frame/messages.ts';
 import { BASE_CSS, element, installStyle } from '../frame/ui.ts';
@@ -59,7 +59,7 @@ const host = startFrame(({ view, t }) => {
         : row(t.device, offText(state, t), '');
   const stream = row(t.stream, state.streaming ? t.streamOn : t.streamOff, state.streaming ? 'on' : '');
   // Several serve-sim on the device can disturb its input.
-  const doubled = state.serveSims.length > 1 ? [row('serve-sim', t.serveSims(state.serveSims.length), 'busy')] : [];
+  const doubled = serveSimsDoubled(state.serveSims) ? [row('serve-sim', t.serveSims(state.serveSims.length), 'busy')] : [];
   root.replaceChildren(device, stream, ...doubled);
 });
 

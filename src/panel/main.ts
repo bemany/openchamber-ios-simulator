@@ -29,7 +29,7 @@ const direct = createDirectEditor({ bar, host: () => host, toolbar: () => toolba
 const host = startFrame(
   (context) => {
     toolbar(context);
-    direct.label(context.t);
+    direct.label(context.t, context.view.kind === 'ready' ? context.view.state : null);
   },
   {
     onReady: (context) => {

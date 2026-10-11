@@ -500,7 +500,7 @@ const host: HostClient = startFrame(
   (next) => {
     context = next;
     toolbar(next);
-    direct.label(next.t);
+    direct.label(next.t, stateNow());
     const state = stateNow();
     if (!started && state && !popover) void startTiles(state);
     drawTiles();

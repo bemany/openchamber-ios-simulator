@@ -3,7 +3,7 @@
 import type { HostClient } from '@openchamber/sdk';
 
 import { DIRECT_URL_KEY, normalizeDirectUrl } from '../shared/direct.ts';
-import { QUALITIES, type Quality, type SimState } from '../shared/state.ts';
+import { QUALITIES, serveSimsDoubled, type Quality, type SimState } from '../shared/state.ts';
 import type { FrameContext } from './host.ts';
 import { attachTooltips } from './tooltip.ts';
 import { BASE_CSS, element, icon, installStyle, type IconName } from './ui.ts';
@@ -311,7 +311,7 @@ export const createToolbar = (bar: HTMLElement, host: () => HostClient, options:
       setStatus(state.error ? 'error' : '', text, state.error ?? text);
     }
     else if (state.error) setStatus('error', state.error);
-    else if (state.serveSims.length > 1) {
+    else if (serveSimsDoubled(state.serveSims)) {
       const list = state.serveSims.map((entry) => `${entry.host}:${entry.port}${entry.own ? ` (${t.serveSimOwn})` : ''}`).join(', ');
       setStatus('busy', t.serveSims(state.serveSims.length), `${t.serveSims(state.serveSims.length)}: ${list}. ${t.serveSimsHint}`);
     }
