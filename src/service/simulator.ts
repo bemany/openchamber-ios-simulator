@@ -13,6 +13,7 @@ import { OPCODE, type HidMessage } from './input.ts';
 import { createLinks, type Links } from './links.ts';
 import { solidPng } from './placeholder.ts';
 import { repairInput } from './repair.ts';
+import { createProcessReader, processesFor } from './serve-sim-processes.ts';
 import {
   bootDevice,
   defaultDevice,
@@ -61,6 +62,7 @@ export const createSimulator = () => {
   let panelUdid: string | null = null;
   let placeholderShown = false;
   let watching = false;
+  const serveSimProcesses = createProcessReader();
 
   const links: Links<DeviceLink> = createLinks<DeviceLink>({
     now: () => Date.now(),
@@ -249,6 +251,7 @@ export const createSimulator = () => {
         framed,
         quality,
         skipped: Date.now() - skipped.at < SKIPPED_SHOWN_MS ? skipped.count : 0,
+        serveSims: active ? processesFor(await serveSimProcesses(), active.udid, true) : [],
         error,
       };
     },

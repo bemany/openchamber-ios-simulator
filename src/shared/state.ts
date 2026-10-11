@@ -17,6 +17,9 @@ export type Orientation = 'portrait' | 'portrait_upside_down' | 'landscape_left'
 export type Appearance = 'light' | 'dark' | 'unknown';
 
 /** Hardware keyboard layouts the service can type in; anything else is typed as `us`. */
+/** A serve-sim stream process attached to a device (from the process list). `own`: the extension's helper. */
+export type ServeSimProcess = { pid: number; host: string; port: number; own: boolean };
+
 /** A serve-sim preview server the service found on its machine (`GET /serve-sim/servers`). */
 export type ServeSimServer = { url: string; udid: string; name: string; loopback: boolean };
 
@@ -53,6 +56,8 @@ export type SimState = {
   quality: Quality;
   /** Characters the last paste could not type (no key, pasteboard not writable); 0 after a few seconds. */
   skipped: number;
+  /** serve-sim processes attached to the state's device; more than one can disturb its input. */
+  serveSims: ServeSimProcess[];
   /** Last error for display, or `null`. */
   error: string | null;
 };

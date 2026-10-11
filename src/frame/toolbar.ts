@@ -311,6 +311,10 @@ export const createToolbar = (bar: HTMLElement, host: () => HostClient, options:
       setStatus(state.error ? 'error' : '', text, state.error ?? text);
     }
     else if (state.error) setStatus('error', state.error);
+    else if (state.serveSims.length > 1) {
+      const list = state.serveSims.map((entry) => `${entry.host}:${entry.port}${entry.own ? ` (${t.serveSimOwn})` : ''}`).join(', ');
+      setStatus('busy', t.serveSims(state.serveSims.length), `${t.serveSims(state.serveSims.length)}: ${list}. ${t.serveSimsHint}`);
+    }
     else if (state.skipped > 0) setStatus('busy', t.skipped(state.skipped));
     else {
       const control = state.controller === 'user' ? `, ${t.controlUser}` : state.controller === 'agent' ? `, ${t.controlAgent}` : '';

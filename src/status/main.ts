@@ -58,7 +58,9 @@ const host = startFrame(({ view, t }) => {
         ? row(t.device, `${state.active.name} (${state.active.runtime})`, 'on')
         : row(t.device, offText(state, t), '');
   const stream = row(t.stream, state.streaming ? t.streamOn : t.streamOff, state.streaming ? 'on' : '');
-  root.replaceChildren(device, stream);
+  // Several serve-sim on the device can disturb its input.
+  const doubled = state.serveSims.length > 1 ? [row('serve-sim', t.serveSims(state.serveSims.length), 'busy')] : [];
+  root.replaceChildren(device, stream, ...doubled);
 });
 
 // The Work Status panel sizes this frame to its content.

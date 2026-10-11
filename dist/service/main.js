@@ -2080,6 +2080,97 @@ var repairInput = async (udid, deps) => {
   return deps.restartHelper(udid);
 };
 
+// src/service/serve-sim-processes.ts
+var UUID = /^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/;
+var VALUE_FLAGS = new Set(["--port", "-p", "--host", "--codec", "--panes", "--theme", "-d", "--device"]);
+var NOT_A_STREAM = new Set(["--list", "-l", "--kill", "-k", "--help", "-h", "--version", "-v"]);
+var DEFAULT_PORT = 3200;
+var DEFAULT_HOST = "127.0.0.1";
+var OWN_PORTS = { first: 3100, last: 3109 };
+var serveSimArgs = (command) => {
+  const tokens = command.trim().split(/\s+/);
+  const isServeSim = (token = "") => token === "serve-sim" || token.endsWith("/serve-sim");
+  if (isServeSim(tokens[0]))
+    return tokens.slice(1);
+  if (/(^|\/)node$/.test(tokens[0] ?? "") && isServeSim(tokens[1]))
+    return tokens.slice(2);
+  return null;
+};
+var parseServeSimProcesses = (output) => {
+  const found = [];
+  for (const line of output.split(`
+`)) {
+    const match = /^\s*(\d+)\s+(.*)$/.exec(line);
+    if (!match)
+      continue;
+    const args = serveSimArgs(match[2]);
+    if (!args)
+      continue;
+    let host = DEFAULT_HOST;
+    let port = DEFAULT_PORT;
+    let exitsWithSimulator = false;
+    let stream = true;
+    const devices = [];
+    for (let index = 0;index < args.length; index += 1) {
+      const token = args[index];
+      if (NOT_A_STREAM.has(token)) {
+        stream = false;
+        break;
+      }
+      if (VALUE_FLAGS.has(token)) {
+        const value = args[index += 1] ?? "";
+        if (token === "--host")
+          host = value;
+        if (token === "--port" || token === "-p")
+          port = Number(value) || DEFAULT_PORT;
+        continue;
+      }
+      if (token.startsWith("--host="))
+        host = token.slice("--host=".length);
+      else if (token.startsWith("--port="))
+        port = Number(token.slice("--port=".length)) || DEFAULT_PORT;
+      else if (token === "--exit-on-simulator-shutdown")
+        exitsWithSimulator = true;
+      else if (UUID.test(token))
+        devices.push(token.toUpperCase());
+      else if (!token.startsWith("-")) {
+        if (devices.length === 0 && index === 0) {
+          stream = false;
+          break;
+        }
+      }
+    }
+    if (!stream)
+      continue;
+    const own = host === "127.0.0.1" && port >= OWN_PORTS.first && port <= OWN_PORTS.last && exitsWithSimulator;
+    found.push({ pid: Number(match[1]), host, port, own, devices });
+  }
+  return found;
+};
+var processesFor = (all, udid, booted) => booted ? all.filter((entry) => entry.devices.length === 0 ? true : entry.devices.includes(udid.toUpperCase())).map(({ pid, host, port, own }) => ({ pid, host, port, own })) : [];
+var CACHE_MS = 5000;
+var PS = ["/bin/ps", "ps"];
+var createProcessReader = (read = async () => {
+  const result = await run(PS, ["-axo", "pid=,command="], { timeout: 5000 });
+  return result.ok ? result.stdout : null;
+}) => {
+  let cached = null;
+  let pending = null;
+  return async () => {
+    if (cached && Date.now() - cached.at < CACHE_MS)
+      return cached.list;
+    pending ??= (async () => {
+      const output = await read().catch(() => null);
+      const list = output === null ? [] : parseServeSimProcesses(output);
+      cached = { at: Date.now(), list };
+      return list;
+    })().finally(() => {
+      pending = null;
+    });
+    return pending;
+  };
+};
+
 // src/service/simulator.ts
 var VIEWER_GRACE_MS2 = 35000;
 var DEVICE_POLL_MS = 2000;
@@ -2110,6 +2201,7 @@ var createSimulator = () => {
   let panelUdid = null;
   let placeholderShown = false;
   let watching = false;
+  const serveSimProcesses = createProcessReader();
   const links = createLinks({
     now: () => Date.now(),
     graceMs: VIEWER_GRACE_MS2,
@@ -2289,6 +2381,7 @@ var createSimulator = () => {
         framed,
         quality,
         skipped: Date.now() - skipped.at < SKIPPED_SHOWN_MS ? skipped.count : 0,
+        serveSims: active ? processesFor(await serveSimProcesses(), active.udid, true) : [],
         error
       };
     },
