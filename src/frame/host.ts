@@ -47,7 +47,17 @@ const errorText = (body: string): string => {
   }
 };
 
-export type FrameOptions = { onReady?: (context: HostReadyContext) => void };
+export type FrameOptions = {
+  onReady?: (context: HostReadyContext) => void;
+  /**
+   * The device the toolbar shows and acts on, when it is not the panel's (the
+   * page's focused tile): `/state` asks for it, actions carry it and never
+   * move the panel to it.
+   */
+  target?: () => string | null;
+  /** Hands out a function that polls `/state` at once (after the target changed). */
+  bindRefresh?: (refresh: () => void) => void;
+};
 
 /** Wiring shared by the frames: theme and locale from the host, `/state` polling while visible, redraw on change. */
 export const startFrame = (render: (context: FrameContext) => void, options: FrameOptions = {}): HostClient => {
@@ -72,7 +82,8 @@ export const startFrame = (render: (context: FrameContext) => void, options: Fra
 
   async function poll() {
     try {
-      const result = await host.serviceRequest({ method: 'GET', path: '/state' });
+      const udid = options.target?.() ?? null;
+      const result = await host.serviceRequest({ method: 'GET', path: '/state', ...(udid ? { query: { udid } } : {}) });
       const state = result.status === 200 ? parseState(result.body) : null;
       view = state ? { kind: 'ready', state } : { kind: 'blocked', reason: 'failed', detail: errorText(result.body).slice(0, 200) };
     } catch (cause) {
@@ -88,7 +99,9 @@ export const startFrame = (render: (context: FrameContext) => void, options: Fra
     draw();
     schedule();
     try {
-      const result = await host.serviceRequest({ method: 'POST', path, body: JSON.stringify(body) });
+      const udid = options.target?.() ?? null;
+      const sent = udid ? { udid, ...body, select: false } : body;
+      const result = await host.serviceRequest({ method: 'POST', path, body: JSON.stringify(sent) });
       const state = parseState(result.body);
       if (state) view = { kind: 'ready', state };
       if (result.status >= 400) {
@@ -123,6 +136,7 @@ export const startFrame = (render: (context: FrameContext) => void, options: Fra
     host.dispose();
   });
 
+  options.bindRefresh?.(() => void poll());
   draw();
   void poll();
   return host;

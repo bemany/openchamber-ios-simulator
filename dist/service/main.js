@@ -1547,7 +1547,7 @@ var serverDeps = (booted) => ({
   pageDevice: pagePreviewDevice
 });
 
-// src/service/simulator.ts
+// src/service/device-link.ts
 import http from "node:http";
 
 // src/service/helper.ts
@@ -1802,6 +1802,224 @@ var jpegSize = (jpeg) => {
   return null;
 };
 
+// src/service/device-link.ts
+var RECONNECT_MS = 300;
+var MIN_TOUCH_MS = 40;
+var KEY_GAP_MS = 8;
+var CONFIG_OPCODE = 130;
+var sleep2 = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+var message = (cause) => cause instanceof Error ? cause.message : String(cause);
+var createDeviceLink = (udid, ctx) => {
+  const hub = createFrameHub();
+  let request = null;
+  let connected = false;
+  let starting = false;
+  let closed = false;
+  let reconnectTimer = null;
+  let socket = null;
+  let socketOpen = null;
+  let orientation = null;
+  let touchBeganAt = 0;
+  const stopStream = () => {
+    if (reconnectTimer)
+      clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+    const old = request;
+    request = null;
+    connected = false;
+    old?.destroy();
+  };
+  const closeHid = () => {
+    const old = socket;
+    socket = null;
+    socketOpen = null;
+    orientation = null;
+    try {
+      old?.close();
+    } catch {}
+  };
+  const openHid = async () => {
+    if (socket && socket.readyState === WebSocket.OPEN)
+      return socket;
+    if (socketOpen)
+      return socketOpen;
+    socketOpen = (async () => {
+      const port = await ctx.helperFor(udid);
+      const next = new WebSocket(`${helperBase(port, udid).replace("http:", "ws:")}/ws`);
+      next.binaryType = "arraybuffer";
+      next.onmessage = (event) => {
+        const bytes = new Uint8Array(event.data);
+        if (bytes[0] !== CONFIG_OPCODE)
+          return;
+        try {
+          const config = JSON.parse(new TextDecoder().decode(bytes.subarray(1)));
+          if (config.orientation)
+            orientation = config.orientation;
+        } catch {}
+      };
+      await new Promise((resolve, reject) => {
+        next.onopen = () => resolve();
+        next.onerror = () => reject(new Error("Could not open the HID connection to serve-sim"));
+      });
+      next.onclose = () => {
+        ctx.forgetHelper(udid);
+        if (socket === next)
+          closeHid();
+      };
+      socket = next;
+      return next;
+    })();
+    try {
+      return await socketOpen;
+    } catch (cause) {
+      closeHid();
+      throw cause;
+    }
+  };
+  const start = async () => {
+    if (closed || request || starting)
+      return;
+    starting = true;
+    let port;
+    try {
+      port = await ctx.helperFor(udid);
+    } catch (cause) {
+      ctx.onError(udid, message(cause));
+      return;
+    } finally {
+      starting = false;
+    }
+    if (closed || request)
+      return;
+    const parser = createMjpegParser((jpeg) => {
+      const size = jpegSize(jpeg);
+      if (!size || closed)
+        return;
+      ctx.onFrame(udid, hub.publish({ data: jpeg, mime: "image/jpeg", width: size.width, height: size.height, title: ctx.name(udid) }));
+    });
+    const next = http.get(`${helperBase(port, udid)}/stream.mjpeg`, (response) => {
+      if (response.statusCode !== 200) {
+        response.resume();
+        next.destroy();
+        return;
+      }
+      connected = true;
+      ctx.onError(udid, null);
+      response.on("data", (chunk) => parser.push(chunk));
+    });
+    next.on("close", () => {
+      if (request !== next)
+        return;
+      request = null;
+      connected = false;
+      ctx.forgetHelper(udid);
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        if (!closed && ctx.wanted(udid))
+          start();
+      }, RECONNECT_MS);
+    });
+    next.on("error", () => {
+      return;
+    });
+    request = next;
+    openHid().catch(() => {
+      return;
+    });
+  };
+  return {
+    udid,
+    hub,
+    start,
+    connected: () => connected,
+    running: () => request !== null || starting,
+    orientation: () => orientation,
+    setOrientation(next) {
+      orientation = next;
+    },
+    reset() {
+      stopStream();
+      closeHid();
+    },
+    async sendHid(messages) {
+      if (messages.length === 0)
+        return;
+      const open = await openHid();
+      for (const hid of messages) {
+        if (hid.op === "touch" && hid.type === "end") {
+          const held = Date.now() - touchBeganAt;
+          if (held < MIN_TOUCH_MS)
+            await sleep2(MIN_TOUCH_MS - held);
+        }
+        open.send(encodeMessage(hid));
+        if (hid.op === "touch" && hid.type === "begin")
+          touchBeganAt = Date.now();
+        if (hid.op === "key")
+          await sleep2(KEY_GAP_MS);
+      }
+    },
+    async sendRaw(opcode, payload) {
+      (await openHid()).send(encodeHid(opcode, payload));
+    },
+    close() {
+      closed = true;
+      stopStream();
+      closeHid();
+    }
+  };
+};
+
+// src/service/links.ts
+var createLinks = (deps) => {
+  const links = new Map;
+  let panelUdid = null;
+  let panelSeenAt = 0;
+  const entry = (udid) => {
+    let found = links.get(udid);
+    if (!found) {
+      found = { link: deps.open(udid), pageSeenAt: 0 };
+      links.set(udid, found);
+    }
+    return found;
+  };
+  const panelWatching = () => deps.now() - panelSeenAt < deps.graceMs;
+  const wanted = (udid) => panelUdid === udid && panelWatching() || deps.now() - (links.get(udid)?.pageSeenAt ?? 0) < deps.graceMs;
+  return {
+    get: (udid) => entry(udid).link,
+    peek: (udid) => links.get(udid)?.link,
+    seenByPage(udid) {
+      const found = entry(udid);
+      found.pageSeenAt = deps.now();
+      return found.link;
+    },
+    seenByPanel() {
+      panelSeenAt = deps.now();
+    },
+    panelWatching,
+    setPanel(udid) {
+      panelUdid = udid;
+    },
+    wanted,
+    watched: () => [...links.keys()].filter(wanted),
+    sweep() {
+      const closed = [];
+      for (const [udid, found] of links) {
+        if (wanted(udid))
+          continue;
+        found.link.close();
+        links.delete(udid);
+        closed.push(udid);
+      }
+      return closed;
+    },
+    closeAll() {
+      for (const found of links.values())
+        found.link.close();
+      links.clear();
+    }
+  };
+};
+
 // src/service/placeholder.ts
 import { deflateSync as deflateSync2 } from "node:zlib";
 var CRC_TABLE2 = (() => {
@@ -1865,15 +2083,11 @@ var repairInput = async (udid, deps) => {
 // src/service/simulator.ts
 var VIEWER_GRACE_MS2 = 35000;
 var DEVICE_POLL_MS = 2000;
-var RECONNECT_MS = 300;
 var APPEARANCE_TTL_MS = 15000;
-var MIN_TOUCH_MS = 40;
-var KEY_GAP_MS = 8;
 var SKIPPED_SHOWN_MS = 8000;
 var PLACEHOLDER = { width: 402, height: 874, color: 1907483 };
-var CONFIG_OPCODE = 130;
-var sleep2 = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-var message = (cause) => cause instanceof Error ? cause.message : String(cause);
+var sleep3 = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+var message2 = (cause) => cause instanceof Error ? cause.message : String(cause);
 var createSimulator = () => {
   const hub = createFrameHub();
   let devices = [];
@@ -1882,30 +2096,42 @@ var createSimulator = () => {
   let busy = null;
   let error = null;
   let controller = "none";
-  let appearance = null;
+  const appearances = new Map;
   const layouts = new Map;
-  let orientation = null;
   const helperPorts = new Map;
   const helperFor = async (udid) => {
     const port = await ensureHelper(udid, helperPorts.get(udid) ?? null);
     helperPorts.set(udid, port);
     return port;
   };
-  let reconnectTimer = null;
-  let lastViewerAt = 0;
   let framed = true;
   let quality = DEFAULT_QUALITY;
   let skipped = { count: 0, at: 0 };
-  let streamUdid = null;
-  let streamRequest = null;
-  let streamConnected = false;
+  let panelUdid = null;
   let placeholderShown = false;
   let watching = false;
-  let hidSocket = null;
-  let hidUdid = null;
-  let hidOpen = null;
-  let touchBeganAt = 0;
+  const links = createLinks({
+    now: () => Date.now(),
+    graceMs: VIEWER_GRACE_MS2,
+    open: (udid) => createDeviceLink(udid, {
+      helperFor,
+      forgetHelper: (device) => helperPorts.delete(device),
+      name: (device) => devices.find((candidate) => candidate.udid === device)?.name ?? "Simulator",
+      wanted: (device) => links.wanted(device),
+      onFrame: (device, frame) => {
+        if (device !== panelUdid)
+          return;
+        placeholderShown = false;
+        hub.publish({ data: frame.data, mime: frame.mime, width: frame.width, height: frame.height, title: frame.title });
+      },
+      onError: (device, next) => {
+        if (device === panelUdid || next === null)
+          error = next;
+      }
+    })
+  });
   const activeDevice = () => shownDevice(devices, selected);
+  const booted = (udid) => devices.some((device) => device.udid === udid && device.state === "Booted");
   const refreshDevices = async (force = false) => {
     if (!force && Date.now() - devicesAt < DEVICE_POLL_MS - 100)
       return devices;
@@ -1913,11 +2139,10 @@ var createSimulator = () => {
       devices = await listDevices();
       devicesAt = Date.now();
     } catch (cause) {
-      error = message(cause);
+      error = message2(cause);
     }
     return devices;
   };
-  const viewerPresent = () => Date.now() - lastViewerAt < VIEWER_GRACE_MS2;
   const showPlaceholder = () => {
     if (placeholderShown)
       return;
@@ -1930,191 +2155,72 @@ var createSimulator = () => {
       title: "No simulator"
     });
   };
-  const stopStream = () => {
-    streamRequest?.destroy();
-    streamRequest = null;
-    streamConnected = false;
-    streamUdid = null;
-  };
-  const closeHid = () => {
-    try {
-      hidSocket?.close();
-    } catch {}
-    hidSocket = null;
-    hidUdid = null;
-    hidOpen = null;
-    orientation = null;
-  };
-  const openHid = async (udid) => {
-    if (hidSocket && hidUdid === udid && hidSocket.readyState === WebSocket.OPEN)
-      return hidSocket;
-    if (hidOpen && hidUdid === udid)
-      return hidOpen;
-    closeHid();
-    hidUdid = udid;
-    hidOpen = (async () => {
-      const port = await helperFor(udid);
-      const socket = new WebSocket(`${helperBase(port, udid).replace("http:", "ws:")}/ws`);
-      socket.binaryType = "arraybuffer";
-      socket.onmessage = (event) => {
-        const bytes = new Uint8Array(event.data);
-        if (bytes[0] !== CONFIG_OPCODE)
-          return;
-        try {
-          const config = JSON.parse(new TextDecoder().decode(bytes.subarray(1)));
-          if (config.orientation)
-            orientation = config.orientation;
-        } catch {}
-      };
-      await new Promise((resolve, reject) => {
-        socket.onopen = () => resolve();
-        socket.onerror = () => reject(new Error("Could not open the HID connection to serve-sim"));
-      });
-      socket.onclose = () => {
-        helperPorts.delete(udid);
-        if (hidSocket === socket)
-          closeHid();
-      };
-      hidSocket = socket;
-      return socket;
-    })();
-    try {
-      return await hidOpen;
-    } catch (cause) {
-      closeHid();
-      throw cause;
-    }
-  };
-  const startStream = async (device) => {
-    stopStream();
-    streamUdid = device.udid;
-    placeholderShown = false;
-    const udid = device.udid;
-    let port;
-    try {
-      port = await helperFor(udid);
-    } catch (cause) {
-      error = message(cause);
-      if (streamUdid === udid)
-        streamUdid = null;
+  const syncPanel = () => {
+    const device = activeDevice();
+    const next = device?.udid ?? null;
+    links.setPanel(next);
+    if (next === panelUdid)
       return;
-    }
-    if (streamUdid !== udid)
+    panelUdid = next;
+    if (!device)
       return;
-    if (!layouts.has(udid))
-      readKeyboardLayout(udid).then((layout) => layouts.set(udid, layout));
-    const parser = createMjpegParser((jpeg) => {
-      const size = jpegSize(jpeg);
-      if (!size || streamUdid !== udid)
-        return;
-      hub.publish({ data: jpeg, mime: "image/jpeg", width: size.width, height: size.height, title: device.name });
-    });
-    const request = http.get(`${helperBase(port, udid)}/stream.mjpeg`, (response) => {
-      if (response.statusCode !== 200) {
-        response.resume();
-        request.destroy();
-        return;
-      }
-      streamConnected = true;
-      error = null;
-      response.on("data", (chunk) => parser.push(chunk));
-    });
-    request.on("close", () => {
-      if (streamRequest !== request)
-        return;
-      streamRequest = null;
-      streamConnected = false;
-      streamUdid = null;
+    const link = links.get(device.udid);
+    const newest = link.hub.current();
+    if (newest)
+      hub.publish({ data: newest.data, mime: newest.mime, width: newest.width, height: newest.height, title: newest.title });
+  };
+  const tick = async () => {
+    syncPanel();
+    if (links.panelWatching()) {
+      if (!panelUdid)
+        showPlaceholder();
+      else
+        links.get(panelUdid).start();
+    }
+    for (const udid of links.watched())
+      if (booted(udid))
+        links.peek(udid)?.start();
+    for (const udid of links.sweep())
       helperPorts.delete(udid);
-      if (reconnectTimer)
-        clearTimeout(reconnectTimer);
-      reconnectTimer = setTimeout(() => {
-        reconnectTimer = null;
-        if (viewerPresent() && !streamRequest)
-          switchStream().catch(() => {
-            return;
-          });
-      }, RECONNECT_MS);
-    });
-    request.on("error", () => {
-      return;
-    });
-    streamRequest = request;
-    openHid(udid).catch(() => {
-      return;
-    });
   };
   const watch = async () => {
     if (watching)
       return;
     watching = true;
     try {
-      while (viewerPresent()) {
+      while (links.panelWatching() || links.watched().length > 0) {
         await refreshDevices();
-        const device = activeDevice();
-        if (!device) {
-          stopStream();
-          closeHid();
-          showPlaceholder();
-        } else if (streamUdid !== device.udid) {
-          await startStream(device);
-          if (!streamRequest)
-            await sleep2(RECONNECT_MS);
-        }
-        await sleep2(DEVICE_POLL_MS);
+        await tick();
+        await sleep3(DEVICE_POLL_MS);
       }
-      stopStream();
+      links.sweep();
     } finally {
       watching = false;
     }
   };
   const nextFrame = (after, waitMs, signal) => {
-    lastViewerAt = Date.now();
+    links.seenByPanel();
     watch();
     return hub.next(after, waitMs, signal);
   };
-  const requireActive = async () => {
+  const nextFrameOf = (udid, after, waitMs, signal) => {
+    const link = links.seenByPage(udid);
+    watch();
+    if (booted(udid))
+      link.start();
+    return link.hub.next(after, waitMs, signal);
+  };
+  const requireDevice = async (udid) => {
     await refreshDevices(true);
-    const device = activeDevice();
+    const device = udid ? devices.find((candidate) => candidate.udid === udid && candidate.state === "Booted") : activeDevice();
     if (!device)
-      throw new Error("No simulator is booted");
+      throw new Error(udid ? "That simulator is not booted" : "No simulator is booted");
     return device;
   };
-  const sendHid = async (messages) => {
-    if (messages.length === 0)
-      return;
-    const device = activeDevice() ?? await requireActive();
-    const socket = await openHid(device.udid);
-    for (const hid of messages) {
-      if (hid.op === "touch" && hid.type === "end") {
-        const held = Date.now() - touchBeganAt;
-        if (held < MIN_TOUCH_MS)
-          await sleep2(MIN_TOUCH_MS - held);
-      }
-      socket.send(encodeMessage(hid));
-      if (hid.op === "touch" && hid.type === "begin")
-        touchBeganAt = Date.now();
-      if (hid.op === "key")
-        await sleep2(KEY_GAP_MS);
-    }
-  };
-  const sendRaw = async (opcode, payload) => {
-    const device = await requireActive();
-    const socket = await openHid(device.udid);
-    socket.send(encodeHid(opcode, payload));
-  };
+  const linkOf = async (udid) => links.get((await requireDevice(udid)).udid);
   const switchStream = async () => {
     await refreshDevices(true);
-    const device = activeDevice();
-    if (!device) {
-      stopStream();
-      closeHid();
-      showPlaceholder();
-      return;
-    }
-    if (device.udid === streamUdid || !viewerPresent())
-      return;
-    await startStream(device);
+    await tick();
   };
   const runBusy = async (kind, work) => {
     if (busy)
@@ -2124,38 +2230,61 @@ var createSimulator = () => {
     try {
       await work();
     } catch (cause) {
-      error = message(cause);
+      error = message2(cause);
       throw cause;
     } finally {
       busy = null;
       await refreshDevices(true);
     }
   };
+  const layoutOf = async (udid) => {
+    let layout = layouts.get(udid);
+    if (!layout) {
+      layout = await readKeyboardLayout(udid);
+      layouts.set(udid, layout);
+    }
+    return layout;
+  };
   return {
     hub,
     nextFrame,
-    sendHid,
-    async state() {
+    nextFrameOf,
+    async sendHid(messages, udid) {
+      if (messages.length === 0)
+        return;
+      await (await linkOf(udid)).sendHid(messages);
+    },
+    async state(target) {
       await refreshDevices();
-      const active = activeDevice();
-      if (active) {
-        selected = active.udid;
-        if (!appearance || appearance.udid !== active.udid || Date.now() - appearance.at > APPEARANCE_TTL_MS) {
-          appearance = { udid: active.udid, value: await readAppearance(active.udid), at: Date.now() };
+      if (!target) {
+        const shown = activeDevice();
+        if (shown)
+          selected = shown.udid;
+        if (!selected || !devices.some((device) => device.udid === selected)) {
+          selected = devices.find((device) => device.state === "Booted")?.udid ?? defaultDevice(devices)?.udid ?? null;
         }
       }
-      if (!selected || !devices.some((device) => device.udid === selected)) {
-        selected = devices.find((device) => device.state === "Booted")?.udid ?? defaultDevice(devices)?.udid ?? null;
+      const active = target ? devices.find((device) => device.udid === target && device.state === "Booted") ?? null : activeDevice();
+      if (active) {
+        const known = appearances.get(active.udid);
+        if (!known || Date.now() - known.at > APPEARANCE_TTL_MS)
+          appearances.set(active.udid, { value: await readAppearance(active.udid), at: Date.now() });
+        if (!layouts.has(active.udid))
+          layoutOf(active.udid).catch(() => {
+            return;
+          });
       }
+      const link = active ? links.peek(active.udid) : undefined;
+      const streaming = target ? !!link?.connected() && links.wanted(target) : !!link?.connected() && links.panelWatching() && panelUdid === active?.udid;
       return {
         devices,
         active,
-        selected,
+        selected: target ?? selected,
         busy,
-        streaming: streamConnected && viewerPresent() && streamUdid === active?.udid,
+        streaming,
         controller,
-        orientation: active ? orientation : null,
-        appearance: active && appearance?.udid === active.udid ? appearance.value : "unknown",
+        orientation: link?.orientation() ?? null,
+        appearance: active ? appearances.get(active.udid)?.value ?? "unknown" : "unknown",
         keyboard: active ? layouts.get(active.udid) ?? null : null,
         framed,
         quality,
@@ -2163,43 +2292,28 @@ var createSimulator = () => {
         error
       };
     },
-    async boot(udid) {
+    async boot(udid, { select = true } = {}) {
       await refreshDevices(true);
       const device = devices.find((candidate) => candidate.udid === udid);
       if (!device)
         throw new Error("Unknown device");
-      selected = udid;
+      if (select)
+        selected = udid;
       if (device.state !== "Booted") {
         await runBusy("booting", () => bootDevice(udid));
         helperPorts.delete(udid);
       }
       await switchStream();
     },
-    async shutdown() {
+    async shutdown(udid) {
       await refreshDevices(true);
-      const device = activeDevice();
+      const device = udid ? devices.find((candidate) => candidate.udid === udid && candidate.state === "Booted") : activeDevice();
       if (!device)
         return;
       await runBusy("shutting-down", async () => {
-        stopStream();
-        closeHid();
+        links.peek(device.udid)?.reset();
         await shutdownDevice(device.udid);
         helperPorts.delete(device.udid);
-      });
-    },
-    async repairInput() {
-      const device = await requireActive();
-      await runBusy("repairing", async () => {
-        const port = await repairInput(device.udid, {
-          serveSim: (args) => run(SERVE_SIM, args, { timeout: 120000 }),
-          restartHelper: async (udid) => {
-            stopStream();
-            closeHid();
-            helperPorts.delete(udid);
-            return restartHelper(udid);
-          }
-        });
-        helperPorts.set(device.udid, port);
       });
       await switchStream();
     },
@@ -2227,65 +2341,86 @@ var createSimulator = () => {
     setFramed(on) {
       framed = on;
     },
+    active: () => activeDevice(),
+    async knows(udid) {
+      return (await refreshDevices(true)).some((device) => device.udid === udid);
+    },
+    device: (udid) => devices.find((device) => device.udid === udid) ?? null,
     async booted() {
       return (await refreshDevices()).filter((device) => device.state === "Booted");
     },
-    active: () => activeDevice(),
-    async button(name) {
-      await sendRaw(OPCODE.button, name === "home" ? { button: "home" } : { button: "power", page: 12, usage: 48 });
+    currentOf: (udid) => links.peek(udid)?.hub.current() ?? null,
+    async button(name, udid) {
+      await (await linkOf(udid)).sendRaw(OPCODE.button, name === "home" ? { button: "home" } : { button: "power", page: 12, usage: 48 });
     },
-    async rotate(target) {
-      const next = target ?? (orientation === "portrait" || orientation === null ? "landscape_left" : "portrait");
-      await sendRaw(OPCODE.orientation, { orientation: next });
-      orientation = next;
-      const shown = hub.current();
-      if (shown)
-        hub.publish({ data: shown.data, mime: shown.mime, width: shown.width, height: shown.height, title: shown.title });
+    async rotate(target, udid) {
+      const link = await linkOf(udid);
+      const now = link.orientation();
+      const next = target ?? (now === "portrait" || now === null ? "landscape_left" : "portrait");
+      await link.sendRaw(OPCODE.orientation, { orientation: next });
+      link.setOrientation(next);
+      if (link.udid === panelUdid) {
+        const shown = hub.current();
+        if (shown)
+          hub.publish({ data: shown.data, mime: shown.mime, width: shown.width, height: shown.height, title: shown.title });
+      }
+      const own = link.hub.current();
+      if (own)
+        link.hub.publish({ data: own.data, mime: own.mime, width: own.width, height: own.height, title: own.title });
     },
-    async pressButton(name, page, usage) {
+    async pressButton(name, page, usage, udid) {
+      const link = await linkOf(udid);
       if (name === "home")
-        await sendRaw(OPCODE.button, { button: "home" });
+        await link.sendRaw(OPCODE.button, { button: "home" });
       else
-        await sendRaw(OPCODE.button, { button: name, page, usage });
+        await link.sendRaw(OPCODE.button, { button: name, page, usage });
     },
-    async setAppearance(mode) {
-      const device = await requireActive();
+    async setAppearance(mode, udid) {
+      const device = await requireDevice(udid);
       const current = await readAppearance(device.udid);
       const next = mode ?? (current === "dark" ? "light" : "dark");
       await setAppearance(device.udid, next);
-      appearance = { udid: device.udid, value: next, at: Date.now() };
+      appearances.set(device.udid, { value: next, at: Date.now() });
+    },
+    async repairInput(udid) {
+      const device = await requireDevice(udid);
+      await runBusy("repairing", async () => {
+        const port = await repairInput(device.udid, {
+          serveSim: (args) => run(SERVE_SIM, args, { timeout: 120000 }),
+          restartHelper: async (target) => {
+            links.peek(target)?.reset();
+            helperPorts.delete(target);
+            return restartHelper(target);
+          }
+        });
+        helperPorts.set(device.udid, port);
+      });
+      await switchStream();
     },
     async activeUdid() {
-      return (await requireActive()).udid;
+      return (await requireDevice()).udid;
     },
     async axTree() {
-      const device = await requireActive();
+      const device = await requireDevice();
       const port = await helperFor(device.udid);
       const response = await fetch(`${helperBase(port, device.udid)}/ax`, { signal: AbortSignal.timeout(15000) });
       if (!response.ok)
         throw new Error(`Accessibility tree unavailable (${response.status})`);
       return response.text();
     },
-    orientation: () => orientation,
-    async layout() {
-      const active = activeDevice();
-      if (!active)
-        return "us";
-      let layout = layouts.get(active.udid);
-      if (!layout) {
-        layout = await readKeyboardLayout(active.udid);
-        layouts.set(active.udid, layout);
-      }
-      return layout;
+    orientation: (udid) => {
+      const target = udid ?? panelUdid;
+      return target ? links.peek(target)?.orientation() ?? null : null;
+    },
+    async layout(udid) {
+      const target = udid ?? activeDevice()?.udid;
+      return target ? layoutOf(target) : "us";
     },
     setController(next) {
       controller = next;
     },
     stop() {
-      if (reconnectTimer)
-        clearTimeout(reconnectTimer);
-      stopStream();
-      closeHid();
+      links.closeAll();
     }
   };
 };
@@ -2306,7 +2441,16 @@ var sim = createSimulator();
 var servers = serverDeps(() => sim.booted());
 var pasteboard = createPasteboard((args, options) => run(XCRUN, args, options));
 var surfaceInput = { touching: false };
-var pageInput = { touching: false };
+var pageInputs = new Map;
+var pageInputOf = (udid) => {
+  const key = udid ?? "panel";
+  let state = pageInputs.get(key);
+  if (!state) {
+    state = { touching: false };
+    pageInputs.set(key, state);
+  }
+  return state;
+};
 var background = DEFAULT_BACKGROUND;
 var blobs = new Map;
 var BLOBS_MAX = 8;
@@ -2369,6 +2513,13 @@ var readJson = async (req) => {
   const value = JSON.parse(text);
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
 };
+var udidOf = async (value) => {
+  if (value === undefined || value === null || value === "")
+    return;
+  if (typeof value !== "string")
+    return null;
+  return sim.device(value) || await sim.knows(value) ? value : null;
+};
 var handleFrame = async (_req, res, url) => {
   const after = Number(url.searchParams.get("after") ?? "0") || 0;
   const wait = Math.min(Number(url.searchParams.get("wait") ?? "0") || 0, SURFACE_FRAME_WAIT_MS);
@@ -2421,11 +2572,14 @@ var handleInput = async (req, res) => {
   send(res, 200, { ok: true, skippedChars });
 };
 var handlePageFrame = async (_req, res, url) => {
+  const udid = await udidOf(url.searchParams.get("udid"));
+  if (udid === null)
+    return send(res, 404, { error: "unknown device" });
   const after = Number(url.searchParams.get("after") ?? "0") || 0;
   const wait = Math.min(Number(url.searchParams.get("wait") ?? "0") || 0, PAGE_WAIT_MS);
   const abort = new AbortController;
   res.on("close", () => abort.abort());
-  const frame = await sim.nextFrame(after, wait, abort.signal);
+  const frame = udid ? await sim.nextFrameOf(udid, after, wait, abort.signal) : await sim.nextFrame(after, wait, abort.signal);
   if (res.destroyed)
     return;
   if (!frame) {
@@ -2441,37 +2595,43 @@ var handlePageFrame = async (_req, res, url) => {
     mime: picture.mime,
     width: picture.width,
     height: picture.height,
-    degrees: frame.mime === "image/jpeg" ? rotationFor(sim.orientation()) : 0,
-    data: putBlob(`frame-${frame.seq}`, picture.data.toString("base64"))
+    degrees: frame.mime === "image/jpeg" ? rotationFor(sim.orientation(udid)) : 0,
+    data: putBlob(`frame-${udid ?? "panel"}-${frame.seq}`, picture.data.toString("base64"))
   };
   send(res, 200, answer);
 };
 var handlePageInput = async (req, res) => {
   const body = await readBody(req);
   const batch = readSurfaceInputBatch(body);
-  const { width, height } = JSON.parse(body);
+  const { width, height, udid: rawUdid } = JSON.parse(body);
   if (!batch || typeof width !== "number" || typeof height !== "number" || width <= 0 || height <= 0) {
     return send(res, 400, { error: "bad input batch" });
   }
-  const current = sim.hub.current();
+  const udid = await udidOf(rawUdid);
+  if (udid === null)
+    return send(res, 404, { error: "unknown device" });
+  const current = udid ? sim.currentOf(udid) : sim.hub.current();
   if (!current || current.mime !== "image/jpeg")
     return send(res, 409, { error: "no simulator picture" });
   const expected = shrunkSize(current.width, current.height, divisor());
   if (expected.width !== width || expected.height !== height)
     return send(res, 409, { error: "stale frame" });
-  const layout = await sim.layout();
+  const layout = await sim.layout(udid);
   const { skippedChars } = await sendInput(batch.events, {
     layout,
-    udid: sim.active()?.udid ?? null,
+    udid: udid ?? sim.active()?.udid ?? null,
     pasteboard,
-    translate: (events) => translateInput(events, { width, height }, pageInput, { layout }),
-    send: (messages) => sim.sendHid(messages)
+    translate: (events) => translateInput(events, { width, height }, pageInputOf(udid), { layout }),
+    send: (messages) => sim.sendHid(messages, udid)
   });
   sim.noteSkipped(skippedChars);
   send(res, 200, { ok: true, skippedChars });
 };
-var handleChrome = async (_req, res) => {
-  const type = sim.active()?.deviceType;
+var handleChrome = async (_req, res, url) => {
+  const udid = await udidOf(url.searchParams.get("udid"));
+  if (udid === null)
+    return send(res, 404, { error: "unknown device" });
+  const type = (udid ? sim.device(udid) : sim.active())?.deviceType;
   const at = divisor();
   const chrome = type ? await loadChrome(type, at) : null;
   if (type)
@@ -2491,6 +2651,16 @@ var handleBlob = async (_req, res, url) => {
     return send(res, 404, { error: "gone" });
   res.writeHead(200, { "Content-Type": "text/plain", "Cache-Control": "no-store" });
   res.end(blob.slice(offset, offset + BLOB_CHUNK));
+};
+
+class UnknownDevice extends Error {
+}
+var target = async (req) => {
+  const body = await readJson(req);
+  const udid = await udidOf(body.udid);
+  if (udid === null)
+    throw new UnknownDevice("unknown device");
+  return { body, udid };
 };
 var routes = {
   "GET /surface/frame": handleFrame,
@@ -2515,7 +2685,12 @@ var routes = {
       return send(res, 404, { error: "pasteboard empty or unreadable" });
     send(res, 200, { text });
   },
-  "GET /state": async (_req, res) => send(res, 200, await sim.state()),
+  "GET /state": async (_req, res, url) => {
+    const udid = await udidOf(url.searchParams.get("udid"));
+    if (udid === null)
+      return send(res, 404, { error: "unknown device" });
+    send(res, 200, await sim.state(udid));
+  },
   "GET /stats": async (_req, res) => send(res, 200, { raw: sim.hub.current()?.seq ?? 0, shown: presenter.shown.current()?.seq ?? 0 }),
   "POST /select": async (req, res) => {
     const body = await readJson(req);
@@ -2527,12 +2702,14 @@ var routes = {
     const body = await readJson(req);
     if (typeof body.udid !== "string")
       return send(res, 400, { error: "udid missing" });
-    await sim.boot(body.udid);
-    send(res, 200, await sim.state());
+    const tile = body.select === false;
+    await sim.boot(body.udid, { select: !tile });
+    send(res, 200, await sim.state(tile ? body.udid : undefined));
   },
-  "POST /shutdown": async (_req, res) => {
-    await sim.shutdown();
-    send(res, 200, await sim.state());
+  "POST /shutdown": async (req, res) => {
+    const { udid } = await target(req);
+    await sim.shutdown(udid);
+    send(res, 200, await sim.state(udid));
   },
   "GET /page/frame": handlePageFrame,
   "POST /page/input": handlePageInput,
@@ -2542,20 +2719,23 @@ var routes = {
     const body = await readJson(req);
     const page = Number(body.page);
     const usage = Number(body.usage);
+    const udid = await udidOf(body.udid);
+    if (udid === null)
+      return send(res, 404, { error: "unknown device" });
     if (typeof body.name === "string" && page > 0 && usage > 0)
-      await sim.pressButton(body.name, page, usage);
+      await sim.pressButton(body.name, page, usage, udid);
     else
-      await sim.button(body.name === "lock" ? "lock" : "home");
+      await sim.button(body.name === "lock" ? "lock" : "home", udid);
     send(res, 200, { ok: true });
   },
   "POST /frame": async (req, res) => {
-    const body = await readJson(req);
+    const { body, udid } = await target(req);
     sim.setFramed(typeof body.on === "boolean" ? body.on : !sim.framed());
     sim.repaint();
-    send(res, 200, await sim.state());
+    send(res, 200, await sim.state(udid));
   },
   "POST /quality": async (req, res) => {
-    const body = await readJson(req);
+    const { body, udid } = await target(req);
     const next = QUALITIES.find((value) => value === body.value);
     if (!next)
       return send(res, 400, { error: `quality must be one of ${QUALITIES.join(", ")}` });
@@ -2563,7 +2743,7 @@ var routes = {
       sim.setQuality(next);
       sim.repaint();
     }
-    send(res, 200, await sim.state());
+    send(res, 200, await sim.state(udid));
   },
   "POST /frame-style": async (req, res) => {
     const body = await readJson(req);
@@ -2576,20 +2756,21 @@ var routes = {
     send(res, 200, { ok: true });
   },
   "POST /rotate": async (req, res) => {
-    const body = await readJson(req);
-    await sim.rotate(ORIENTATIONS.find((value) => value === body.orientation));
-    send(res, 200, await sim.state());
+    const { body, udid } = await target(req);
+    await sim.rotate(ORIENTATIONS.find((value) => value === body.orientation), udid);
+    send(res, 200, await sim.state(udid));
   },
   "GET /serve-sim/servers": async (_req, res) => send(res, 200, { servers: await findServers(servers) }),
   "GET /serve-sim/check": async (_req, res, url) => send(res, 200, { running: await checkServer(url.searchParams.get("url"), servers) }),
-  "POST /repair-input": async (_req, res) => {
-    await sim.repairInput();
-    send(res, 200, await sim.state());
+  "POST /repair-input": async (req, res) => {
+    const { udid } = await target(req);
+    await sim.repairInput(udid);
+    send(res, 200, await sim.state(udid));
   },
   "POST /appearance": async (req, res) => {
-    const body = await readJson(req);
-    await sim.setAppearance(body.mode === "light" || body.mode === "dark" ? body.mode : undefined);
-    send(res, 200, await sim.state());
+    const { body, udid } = await target(req);
+    await sim.setAppearance(body.mode === "light" || body.mode === "dark" ? body.mode : undefined, udid);
+    send(res, 200, await sim.state(udid));
   },
   "POST /tap": async (req, res) => {
     const body = await readJson(req);
@@ -2633,7 +2814,7 @@ var server = http2.createServer((req, res) => {
       res.destroy();
       return;
     }
-    send(res, cause instanceof SyntaxError ? 400 : 500, { error: cause instanceof Error ? cause.message : String(cause) });
+    send(res, cause instanceof SyntaxError ? 400 : cause instanceof UnknownDevice ? 404 : 500, { error: cause instanceof Error ? cause.message : String(cause) });
   });
 });
 var shutdown = () => {

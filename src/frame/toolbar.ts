@@ -46,6 +46,8 @@ const nextQuality = (quality: Quality): Quality => QUALITIES[(QUALITIES.indexOf(
 export type ToolbarOptions = {
   /** Opens the serve-sim address row; the open button calls it while no address is stored. */
   onEditDirect: () => void;
+  /** The page: the device picker sets the focused tile's device instead of the panel's. */
+  onPick?: (udid: string) => void;
 };
 
 /**
@@ -100,6 +102,10 @@ export const createToolbar = (bar: HTMLElement, host: () => HostClient, options:
   select.addEventListener('change', () => {
     const state = current();
     if (!context || !state) return;
+    if (options.onPick) {
+      options.onPick(select.value);
+      return;
+    }
     store(DEVICE_KEY, select.value);
     // A running device shows at once; one that is off shows as off and boots only from the Boot button.
     void context.act('/select', { udid: select.value });
@@ -114,7 +120,7 @@ export const createToolbar = (bar: HTMLElement, host: () => HostClient, options:
     if (!context || !state) return;
     if (state.active) void context.act('/shutdown');
     else if (select.value) {
-      store(DEVICE_KEY, select.value);
+      if (!options.onPick) store(DEVICE_KEY, select.value);
       void context.act('/boot', { udid: select.value });
     }
   });
@@ -208,7 +214,8 @@ export const createToolbar = (bar: HTMLElement, host: () => HostClient, options:
       if (typeof framed === 'boolean' && framed !== current()?.framed) await context?.act('/frame', { on: framed });
       const value = QUALITIES.find((candidate) => candidate === stored);
       if (value && value !== current()?.quality) await context?.act('/quality', { value });
-      if (!state.active && typeof udid === 'string' && udid !== state.selected && state.devices.some((device) => device.udid === udid)) {
+      // The panel's stored device; the page keeps its own tiles.
+      if (!options.onPick && !state.active && typeof udid === 'string' && udid !== state.selected && state.devices.some((device) => device.udid === udid)) {
         await context?.act('/select', { udid });
       }
     })();

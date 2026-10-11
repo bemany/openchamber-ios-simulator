@@ -47,7 +47,17 @@ const sim = createSimulator();
 const servers = serverDeps(() => sim.booted());
 const pasteboard = createPasteboard((args, options) => run(XCRUN, args, options));
 const surfaceInput: InputState = { touching: false };
-const pageInput: InputState = { touching: false };
+/** Touch state per page tile's device (`panel` for the page without one), so two tiles never share a touch. */
+const pageInputs = new Map<string, InputState>();
+const pageInputOf = (udid: string | undefined): InputState => {
+  const key = udid ?? 'panel';
+  let state = pageInputs.get(key);
+  if (!state) {
+    state = { touching: false };
+    pageInputs.set(key, state);
+  }
+  return state;
+};
 let background = DEFAULT_BACKGROUND;
 
 /** The last few big answers for the page, served in parts by `GET /blob`. */
@@ -116,6 +126,16 @@ const readJson = async (req: http.IncomingMessage): Promise<Record<string, unkno
   return value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
 };
 
+/**
+ * The optional `udid` of a page tile's request: `undefined` for the panel's
+ * device, `null` for a device that is not listed (answer 404).
+ */
+const udidOf = async (value: unknown): Promise<string | undefined | null> => {
+  if (value === undefined || value === null || value === '') return undefined;
+  if (typeof value !== 'string') return null;
+  return sim.device(value) || (await sim.knows(value)) ? value : null;
+};
+
 const handleFrame = async (_req: http.IncomingMessage, res: http.ServerResponse, url: URL) => {
   const after = Number(url.searchParams.get('after') ?? '0') || 0;
   const wait = Math.min(Number(url.searchParams.get('wait') ?? '0') || 0, SURFACE_FRAME_WAIT_MS);
@@ -166,13 +186,15 @@ const handleInput = async (req: http.IncomingMessage, res: http.ServerResponse) 
   send(res, 200, { ok: true, skippedChars });
 };
 
-/** The raw picture for the page, which turns and frames it itself. */
+/** The raw picture for the page, which turns and frames it itself; `udid` for a tile's own device. */
 const handlePageFrame = async (_req: http.IncomingMessage, res: http.ServerResponse, url: URL) => {
+  const udid = await udidOf(url.searchParams.get('udid'));
+  if (udid === null) return send(res, 404, { error: 'unknown device' });
   const after = Number(url.searchParams.get('after') ?? '0') || 0;
   const wait = Math.min(Number(url.searchParams.get('wait') ?? '0') || 0, PAGE_WAIT_MS);
   const abort = new AbortController();
   res.on('close', () => abort.abort());
-  const frame = await sim.nextFrame(after, wait, abort.signal);
+  const frame = udid ? await sim.nextFrameOf(udid, after, wait, abort.signal) : await sim.nextFrame(after, wait, abort.signal);
   if (res.destroyed) return;
   if (!frame) {
     res.writeHead(204, { 'Cache-Control': 'no-store' });
@@ -186,8 +208,9 @@ const handlePageFrame = async (_req: http.IncomingMessage, res: http.ServerRespo
     mime: picture.mime,
     width: picture.width,
     height: picture.height,
-    degrees: frame.mime === 'image/jpeg' ? rotationFor(sim.orientation()) : 0,
-    data: putBlob(`frame-${frame.seq}`, picture.data.toString('base64')),
+    degrees: frame.mime === 'image/jpeg' ? rotationFor(sim.orientation(udid)) : 0,
+    // Per device: tiles never read each other's pictures.
+    data: putBlob(`frame-${udid ?? 'panel'}-${frame.seq}`, picture.data.toString('base64')),
   };
   send(res, 200, answer);
 };
@@ -196,29 +219,33 @@ const handlePageFrame = async (_req: http.IncomingMessage, res: http.ServerRespo
 const handlePageInput = async (req: http.IncomingMessage, res: http.ServerResponse) => {
   const body = await readBody(req);
   const batch = readSurfaceInputBatch(body);
-  const { width, height } = JSON.parse(body) as { width?: unknown; height?: unknown };
+  const { width, height, udid: rawUdid } = JSON.parse(body) as { width?: unknown; height?: unknown; udid?: unknown };
   if (!batch || typeof width !== 'number' || typeof height !== 'number' || width <= 0 || height <= 0) {
     return send(res, 400, { error: 'bad input batch' });
   }
-  const current = sim.hub.current();
+  const udid = await udidOf(rawUdid);
+  if (udid === null) return send(res, 404, { error: 'unknown device' });
+  const current = udid ? sim.currentOf(udid) : sim.hub.current();
   if (!current || current.mime !== 'image/jpeg') return send(res, 409, { error: 'no simulator picture' });
   // The page draws pictures shrunk to the current quality; input on another size belongs to an older view.
   const expected = shrunkSize(current.width, current.height, divisor());
   if (expected.width !== width || expected.height !== height) return send(res, 409, { error: 'stale frame' });
-  const layout = await sim.layout();
+  const layout = await sim.layout(udid);
   const { skippedChars } = await sendInput(batch.events, {
     layout,
-    udid: sim.active()?.udid ?? null,
+    udid: udid ?? sim.active()?.udid ?? null,
     pasteboard,
-    translate: (events) => translateInput(events, { width, height }, pageInput, { layout }),
-    send: (messages) => sim.sendHid(messages),
+    translate: (events) => translateInput(events, { width, height }, pageInputOf(udid), { layout }),
+    send: (messages) => sim.sendHid(messages, udid),
   });
   sim.noteSkipped(skippedChars);
   send(res, 200, { ok: true, skippedChars });
 };
 
-const handleChrome = async (_req: http.IncomingMessage, res: http.ServerResponse) => {
-  const type = sim.active()?.deviceType;
+const handleChrome = async (_req: http.IncomingMessage, res: http.ServerResponse, url: URL) => {
+  const udid = await udidOf(url.searchParams.get('udid'));
+  if (udid === null) return send(res, 404, { error: 'unknown device' });
+  const type = (udid ? sim.device(udid) : sim.active())?.deviceType;
   const at = divisor();
   const chrome = type ? await loadChrome(type, at) : null;
   if (type) chromes.set(`${type}@${at}`, chrome);
@@ -240,6 +267,16 @@ const handleBlob = async (_req: http.IncomingMessage, res: http.ServerResponse, 
   if (blob === undefined) return send(res, 404, { error: 'gone' });
   res.writeHead(200, { 'Content-Type': 'text/plain', 'Cache-Control': 'no-store' });
   res.end(blob.slice(offset, offset + BLOB_CHUNK));
+};
+
+class UnknownDevice extends Error {}
+
+/** An action's body and its optional `udid` (a page tile's device); throws for an unknown one. */
+const target = async (req: http.IncomingMessage): Promise<{ body: Record<string, unknown>; udid: string | undefined }> => {
+  const body = await readJson(req);
+  const udid = await udidOf(body.udid);
+  if (udid === null) throw new UnknownDevice('unknown device');
+  return { body, udid };
 };
 
 type Route = (req: http.IncomingMessage, res: http.ServerResponse, url: URL) => Promise<void>;
@@ -267,7 +304,12 @@ const routes: Record<string, Route> = {
     send(res, 200, { text });
   },
 
-  'GET /state': async (_req, res) => send(res, 200, await sim.state()),
+  // `udid`: the state of a page tile's device instead of the panel's.
+  'GET /state': async (_req, res, url) => {
+    const udid = await udidOf(url.searchParams.get('udid'));
+    if (udid === null) return send(res, 404, { error: 'unknown device' });
+    send(res, 200, await sim.state(udid));
+  },
   /** Counters for scripts/bench.mjs: raw frames from serve-sim and pictures prepared for the surface so far. */
   'GET /stats': async (_req, res) => send(res, 200, { raw: sim.hub.current()?.seq ?? 0, shown: presenter.shown.current()?.seq ?? 0 }),
   'POST /select': async (req, res) => {
@@ -275,15 +317,18 @@ const routes: Record<string, Route> = {
     if (typeof body.udid === 'string') await sim.select(body.udid);
     send(res, 200, await sim.state());
   },
+  // `select: false` (page tiles): boot without showing the device in the panel.
   'POST /boot': async (req, res) => {
     const body = await readJson(req);
     if (typeof body.udid !== 'string') return send(res, 400, { error: 'udid missing' });
-    await sim.boot(body.udid);
-    send(res, 200, await sim.state());
+    const tile = body.select === false;
+    await sim.boot(body.udid, { select: !tile });
+    send(res, 200, await sim.state(tile ? body.udid : undefined));
   },
-  'POST /shutdown': async (_req, res) => {
-    await sim.shutdown();
-    send(res, 200, await sim.state());
+  'POST /shutdown': async (req, res) => {
+    const { udid } = await target(req);
+    await sim.shutdown(udid);
+    send(res, 200, await sim.state(udid));
   },
   'GET /page/frame': handlePageFrame,
   'POST /page/input': handlePageInput,
@@ -294,25 +339,27 @@ const routes: Record<string, Route> = {
     const body = await readJson(req);
     const page = Number(body.page);
     const usage = Number(body.usage);
-    if (typeof body.name === 'string' && page > 0 && usage > 0) await sim.pressButton(body.name, page, usage);
-    else await sim.button(body.name === 'lock' ? 'lock' : 'home');
+    const udid = await udidOf(body.udid);
+    if (udid === null) return send(res, 404, { error: 'unknown device' });
+    if (typeof body.name === 'string' && page > 0 && usage > 0) await sim.pressButton(body.name, page, usage, udid);
+    else await sim.button(body.name === 'lock' ? 'lock' : 'home', udid);
     send(res, 200, { ok: true });
   },
   'POST /frame': async (req, res) => {
-    const body = await readJson(req);
+    const { body, udid } = await target(req);
     sim.setFramed(typeof body.on === 'boolean' ? body.on : !sim.framed());
     sim.repaint();
-    send(res, 200, await sim.state());
+    send(res, 200, await sim.state(udid));
   },
   'POST /quality': async (req, res) => {
-    const body = await readJson(req);
+    const { body, udid } = await target(req);
     const next = QUALITIES.find((value) => value === body.value);
     if (!next) return send(res, 400, { error: `quality must be one of ${QUALITIES.join(', ')}` });
     if (next !== sim.quality()) {
       sim.setQuality(next);
       sim.repaint();
     }
-    send(res, 200, await sim.state());
+    send(res, 200, await sim.state(udid));
   },
   /** The panel's background colour, behind the device frame. */
   'POST /frame-style': async (req, res) => {
@@ -325,21 +372,22 @@ const routes: Record<string, Route> = {
     send(res, 200, { ok: true });
   },
   'POST /rotate': async (req, res) => {
-    const body = await readJson(req);
-    await sim.rotate(ORIENTATIONS.find((value) => value === body.orientation));
-    send(res, 200, await sim.state());
+    const { body, udid } = await target(req);
+    await sim.rotate(ORIENTATIONS.find((value) => value === body.orientation), udid);
+    send(res, 200, await sim.state(udid));
   },
   // For the "Open in serve-sim" address: preview servers on this machine, and whether the stored address answers.
   'GET /serve-sim/servers': async (_req, res) => send(res, 200, { servers: await findServers(servers) }),
   'GET /serve-sim/check': async (_req, res, url) => send(res, 200, { running: await checkServer(url.searchParams.get('url'), servers) }),
-  'POST /repair-input': async (_req, res) => {
-    await sim.repairInput();
-    send(res, 200, await sim.state());
+  'POST /repair-input': async (req, res) => {
+    const { udid } = await target(req);
+    await sim.repairInput(udid);
+    send(res, 200, await sim.state(udid));
   },
   'POST /appearance': async (req, res) => {
-    const body = await readJson(req);
-    await sim.setAppearance(body.mode === 'light' || body.mode === 'dark' ? body.mode : undefined);
-    send(res, 200, await sim.state());
+    const { body, udid } = await target(req);
+    await sim.setAppearance(body.mode === 'light' || body.mode === 'dark' ? body.mode : undefined, udid);
+    send(res, 200, await sim.state(udid));
   },
   'POST /tap': async (req, res) => {
     const body = await readJson(req);
@@ -383,7 +431,7 @@ const server = http.createServer((req, res) => {
       res.destroy();
       return;
     }
-    send(res, cause instanceof SyntaxError ? 400 : 500, { error: cause instanceof Error ? cause.message : String(cause) });
+    send(res, cause instanceof SyntaxError ? 400 : cause instanceof UnknownDevice ? 404 : 500, { error: cause instanceof Error ? cause.message : String(cause) });
   });
 });
 

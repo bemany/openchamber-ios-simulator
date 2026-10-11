@@ -1,16 +1,16 @@
-// Holds the state together: which device is shown, the MJPEG connection to the
-// loopback helper, the HID WebSocket, and boot/shutdown in progress. Frames
-// are only pulled while someone watches (frame requests keep coming). Several
-// simulators may run; the one shown is the chosen one if it runs, else any
-// running one. Nothing is shut down unless asked for.
-import http from 'node:http';
-
+// Holds the state together: which device the panel shows, one link (picture
+// stream and HID socket, device-link.ts) per device someone watches, and
+// boot/shutdown in progress. Frames are only pulled while someone watches
+// (frame requests keep coming): the panel's surface for the device it shows,
+// page tiles for theirs. Several simulators may run; the one the panel shows is
+// the chosen one if it runs, else any running one. Nothing is shut down unless asked for.
 import { DEFAULT_QUALITY, type Appearance, type Busy, type Device, type KeyboardLayout, type Orientation, type Quality, type SimState } from '../shared/state.ts';
+import { createDeviceLink, type DeviceLink } from './device-link.ts';
 import { run, SERVE_SIM } from './exec.ts';
 import { createFrameHub, type Frame } from './frames.ts';
 import { ensureHelper, helperBase, restartHelper } from './helper.ts';
-import { encodeHid, encodeMessage, OPCODE, type HidMessage } from './input.ts';
-import { createMjpegParser, jpegSize } from './mjpeg.ts';
+import { OPCODE, type HidMessage } from './input.ts';
+import { createLinks, type Links } from './links.ts';
 import { solidPng } from './placeholder.ts';
 import { repairInput } from './repair.ts';
 import {
@@ -27,22 +27,16 @@ import {
 /** A viewer counts as present for this long after its last frame request. */
 const VIEWER_GRACE_MS = 35_000;
 const DEVICE_POLL_MS = 2_000;
-/** After the stream drops while someone watches, reconnect this soon (the device poll is the safety net). */
-const RECONNECT_MS = 300;
 const APPEARANCE_TTL_MS = 15_000;
-/** iOS sometimes drops a tap with no duration; the serve-sim CLI holds 40 ms. */
-const MIN_TOUCH_MS = 40;
-const KEY_GAP_MS = 8;
 /** How long the toolbar notes skipped characters after a paste. */
 const SKIPPED_SHOWN_MS = 8_000;
 const PLACEHOLDER = { width: 402, height: 874, color: 0x1d1b1b };
-/** serve-sim's HID socket sends the screen config with this opcode. */
-const CONFIG_OPCODE = 130;
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const message = (cause: unknown) => (cause instanceof Error ? cause.message : String(cause));
 
 export const createSimulator = () => {
+  /** The panel's pictures: the frames of the device it shows, numbered on across switches, or a placeholder. */
   const hub = createFrameHub();
   let devices: Device[] = [];
   let devicesAt = 0;
@@ -50,9 +44,9 @@ export const createSimulator = () => {
   let busy: Busy = null;
   let error: string | null = null;
   let controller: SimState['controller'] = 'none';
-  let appearance: { udid: string; value: Appearance; at: number } | null = null;
+  /** Light or dark per device, read at most every APPEARANCE_TTL_MS. */
+  const appearances = new Map<string, { value: Appearance; at: number }>();
   const layouts = new Map<string, KeyboardLayout>();
-  let orientation: Orientation | null = null;
   /** The loopback helper each device is reached through; only its own (see helper.ts). */
   const helperPorts = new Map<string, number>();
   const helperFor = async (udid: string): Promise<number> => {
@@ -60,26 +54,36 @@ export const createSimulator = () => {
     helperPorts.set(udid, port);
     return port;
   };
-  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  let lastViewerAt = 0;
   let framed = true;
   let quality: Quality = DEFAULT_QUALITY;
   let skipped: { count: number; at: number } = { count: 0, at: 0 };
-
-  // Upstream MJPEG for exactly one device.
-  let streamUdid: string | null = null;
-  let streamRequest: http.ClientRequest | null = null;
-  let streamConnected = false;
+  /** The device whose frames go to the panel's hub. */
+  let panelUdid: string | null = null;
   let placeholderShown = false;
   let watching = false;
 
-  // HID socket for exactly one device.
-  let hidSocket: WebSocket | null = null;
-  let hidUdid: string | null = null;
-  let hidOpen: Promise<WebSocket> | null = null;
-  let touchBeganAt = 0;
+  const links: Links<DeviceLink> = createLinks<DeviceLink>({
+    now: () => Date.now(),
+    graceMs: VIEWER_GRACE_MS,
+    open: (udid): DeviceLink =>
+      createDeviceLink(udid, {
+        helperFor,
+        forgetHelper: (device) => helperPorts.delete(device),
+        name: (device) => devices.find((candidate) => candidate.udid === device)?.name ?? 'Simulator',
+        wanted: (device): boolean => links.wanted(device),
+        onFrame: (device, frame) => {
+          if (device !== panelUdid) return;
+          placeholderShown = false;
+          hub.publish({ data: frame.data, mime: frame.mime, width: frame.width, height: frame.height, title: frame.title });
+        },
+        onError: (device, next) => {
+          if (device === panelUdid || next === null) error = next;
+        },
+      }),
+  });
 
   const activeDevice = (): Device | null => shownDevice(devices, selected);
+  const booted = (udid: string) => devices.some((device) => device.udid === udid && device.state === 'Booted');
 
   const refreshDevices = async (force = false): Promise<Device[]> => {
     if (!force && Date.now() - devicesAt < DEVICE_POLL_MS - 100) return devices;
@@ -91,8 +95,6 @@ export const createSimulator = () => {
     }
     return devices;
   };
-
-  const viewerPresent = () => Date.now() - lastViewerAt < VIEWER_GRACE_MS;
 
   const showPlaceholder = () => {
     if (placeholderShown) return;
@@ -106,184 +108,76 @@ export const createSimulator = () => {
     });
   };
 
-  const stopStream = () => {
-    streamRequest?.destroy();
-    streamRequest = null;
-    streamConnected = false;
-    streamUdid = null;
+  /** Points the panel at the device it shows now; the newest picture of that device shows at once. */
+  const syncPanel = () => {
+    const device = activeDevice();
+    const next = device?.udid ?? null;
+    links.setPanel(next);
+    if (next === panelUdid) return;
+    panelUdid = next;
+    if (!device) return;
+    const link = links.get(device.udid);
+    const newest = link.hub.current();
+    if (newest) hub.publish({ data: newest.data, mime: newest.mime, width: newest.width, height: newest.height, title: newest.title });
   };
 
-  const closeHid = () => {
-    try {
-      hidSocket?.close();
-    } catch {
-      // already closed
+  /** Connects every watched, running device; closes links nobody watches. */
+  const tick = async () => {
+    syncPanel();
+    if (links.panelWatching()) {
+      if (!panelUdid) showPlaceholder();
+      else void links.get(panelUdid).start();
     }
-    hidSocket = null;
-    hidUdid = null;
-    hidOpen = null;
-    orientation = null;
+    for (const udid of links.watched()) if (booted(udid)) void links.peek(udid)?.start();
+    for (const udid of links.sweep()) helperPorts.delete(udid);
   };
 
-  const openHid = async (udid: string): Promise<WebSocket> => {
-    if (hidSocket && hidUdid === udid && hidSocket.readyState === WebSocket.OPEN) return hidSocket;
-    if (hidOpen && hidUdid === udid) return hidOpen;
-    closeHid();
-    hidUdid = udid;
-    hidOpen = (async () => {
-      const port = await helperFor(udid);
-      const socket = new WebSocket(`${helperBase(port, udid).replace('http:', 'ws:')}/ws`);
-      socket.binaryType = 'arraybuffer';
-      socket.onmessage = (event) => {
-        const bytes = new Uint8Array(event.data as ArrayBuffer);
-        if (bytes[0] !== CONFIG_OPCODE) return;
-        try {
-          const config = JSON.parse(new TextDecoder().decode(bytes.subarray(1))) as { orientation?: Orientation };
-          if (config.orientation) orientation = config.orientation;
-        } catch {
-          // not ours to fix
-        }
-      };
-      await new Promise<void>((resolve, reject) => {
-        socket.onopen = () => resolve();
-        socket.onerror = () => reject(new Error('Could not open the HID connection to serve-sim'));
-      });
-      socket.onclose = () => {
-        helperPorts.delete(udid);
-        if (hidSocket === socket) closeHid();
-      };
-      hidSocket = socket;
-      return socket;
-    })();
-    try {
-      return await hidOpen;
-    } catch (cause) {
-      closeHid();
-      throw cause;
-    }
-  };
-
-  const startStream = async (device: Device) => {
-    stopStream();
-    streamUdid = device.udid;
-    placeholderShown = false;
-    const udid = device.udid;
-    let port: number;
-    try {
-      port = await helperFor(udid);
-    } catch (cause) {
-      error = message(cause);
-      if (streamUdid === udid) streamUdid = null;
-      return;
-    }
-    if (streamUdid !== udid) return;
-    if (!layouts.has(udid)) void readKeyboardLayout(udid).then((layout) => layouts.set(udid, layout));
-    const parser = createMjpegParser((jpeg) => {
-      const size = jpegSize(jpeg);
-      if (!size || streamUdid !== udid) return;
-      hub.publish({ data: jpeg, mime: 'image/jpeg', width: size.width, height: size.height, title: device.name });
-    });
-    const request = http.get(`${helperBase(port, udid)}/stream.mjpeg`, (response) => {
-      if (response.statusCode !== 200) {
-        response.resume();
-        request.destroy();
-        return;
-      }
-      streamConnected = true;
-      error = null;
-      response.on('data', (chunk: Buffer) => parser.push(chunk));
-    });
-    request.on('close', () => {
-      if (streamRequest !== request) return;
-      streamRequest = null;
-      streamConnected = false;
-      streamUdid = null;
-      // Its helper may be gone (it exits with its simulator): look it up again, and come back soon.
-      helperPorts.delete(udid);
-      if (reconnectTimer) clearTimeout(reconnectTimer);
-      reconnectTimer = setTimeout(() => {
-        reconnectTimer = null;
-        if (viewerPresent() && !streamRequest) void switchStream().catch(() => undefined);
-      }, RECONNECT_MS);
-    });
-    request.on('error', () => undefined);
-    streamRequest = request;
-    // The HID socket reports the orientation the picture needs as soon as it connects.
-    void openHid(udid).catch(() => undefined);
-  };
-
-  /** Runs while someone watches: notices device changes and (re)connects the stream. */
+  /** Runs while anyone watches: notices device changes and (re)connects streams. */
   const watch = async () => {
     if (watching) return;
     watching = true;
     try {
-      while (viewerPresent()) {
+      while (links.panelWatching() || links.watched().length > 0) {
         await refreshDevices();
-        const device = activeDevice();
-        if (!device) {
-          stopStream();
-          closeHid();
-          showPlaceholder();
-        } else if (streamUdid !== device.udid) {
-          await startStream(device);
-          if (!streamRequest) await sleep(RECONNECT_MS);
-        }
+        await tick();
         await sleep(DEVICE_POLL_MS);
       }
-      stopStream();
+      links.sweep();
     } finally {
       watching = false;
     }
   };
 
+  /** The panel's next picture. */
   const nextFrame = (after: number, waitMs: number, signal?: AbortSignal): Promise<Frame | null> => {
-    lastViewerAt = Date.now();
+    links.seenByPanel();
     void watch();
     return hub.next(after, waitMs, signal);
   };
 
-  const requireActive = async (): Promise<Device> => {
+  /** A page tile's next picture of `udid`. */
+  const nextFrameOf = (udid: string, after: number, waitMs: number, signal?: AbortSignal): Promise<Frame | null> => {
+    const link = links.seenByPage(udid);
+    void watch();
+    if (booted(udid)) void link.start();
+    return link.hub.next(after, waitMs, signal);
+  };
+
+  /** The running device `udid`, or the panel's device without one. */
+  const requireDevice = async (udid?: string): Promise<Device> => {
     await refreshDevices(true);
-    const device = activeDevice();
-    if (!device) throw new Error('No simulator is booted');
+    const device = udid ? devices.find((candidate) => candidate.udid === udid && candidate.state === 'Booted') : activeDevice();
+    if (!device) throw new Error(udid ? 'That simulator is not booted' : 'No simulator is booted');
     return device;
   };
 
-  /** Sends HID messages in order, with a short gap between keys so iOS does not drop them. */
-  const sendHid = async (messages: HidMessage[]) => {
-    if (messages.length === 0) return;
-    const device = activeDevice() ?? (await requireActive());
-    const socket = await openHid(device.udid);
-    for (const hid of messages) {
-      if (hid.op === 'touch' && hid.type === 'end') {
-        const held = Date.now() - touchBeganAt;
-        if (held < MIN_TOUCH_MS) await sleep(MIN_TOUCH_MS - held);
-      }
-      socket.send(encodeMessage(hid));
-      if (hid.op === 'touch' && hid.type === 'begin') touchBeganAt = Date.now();
-      if (hid.op === 'key') await sleep(KEY_GAP_MS);
-    }
-  };
+  /** The link to send input through (opened when nobody watches it yet). */
+  const linkOf = async (udid?: string): Promise<DeviceLink> => links.get((await requireDevice(udid)).udid);
 
-  const sendRaw = async (opcode: number, payload: object) => {
-    const device = await requireActive();
-    const socket = await openHid(device.udid);
-    socket.send(encodeHid(opcode, payload));
-  };
-
-  /** Moves the stream to the device now shown, right away instead of at the next device poll. */
+  /** Moves the panel to the device now shown, right away instead of at the next device poll. */
   const switchStream = async () => {
     await refreshDevices(true);
-    const device = activeDevice();
-    if (!device) {
-      // The chosen device is off: stop showing the previous one.
-      stopStream();
-      closeHid();
-      showPlaceholder();
-      return;
-    }
-    if (device.udid === streamUdid || !viewerPresent()) return;
-    await startStream(device);
+    await tick();
   };
 
   const runBusy = async (kind: Exclude<Busy, null>, work: () => Promise<void>) => {
@@ -301,32 +195,56 @@ export const createSimulator = () => {
     }
   };
 
+  const layoutOf = async (udid: string): Promise<KeyboardLayout> => {
+    let layout = layouts.get(udid);
+    if (!layout) {
+      layout = await readKeyboardLayout(udid);
+      layouts.set(udid, layout);
+    }
+    return layout;
+  };
+
   return {
     hub,
     nextFrame,
-    sendHid,
+    nextFrameOf,
 
-    async state(): Promise<SimState> {
+    /** Sends HID messages to `udid`, or to the panel's device. */
+    async sendHid(messages: HidMessage[], udid?: string) {
+      if (messages.length === 0) return;
+      await (await linkOf(udid)).sendHid(messages);
+    },
+
+    /**
+     * The state the toolbar draws. Without `target` for the panel's device;
+     * with it for a page tile's device (`active` is that device while it runs).
+     */
+    async state(target?: string): Promise<SimState> {
       await refreshDevices();
-      const active = activeDevice();
-      if (active) {
-        selected = active.udid;
-        if (!appearance || appearance.udid !== active.udid || Date.now() - appearance.at > APPEARANCE_TTL_MS) {
-          appearance = { udid: active.udid, value: await readAppearance(active.udid), at: Date.now() };
+      if (!target) {
+        const shown = activeDevice();
+        if (shown) selected = shown.udid;
+        if (!selected || !devices.some((device) => device.udid === selected)) {
+          selected = devices.find((device) => device.state === 'Booted')?.udid ?? defaultDevice(devices)?.udid ?? null;
         }
       }
-      if (!selected || !devices.some((device) => device.udid === selected)) {
-        selected = devices.find((device) => device.state === 'Booted')?.udid ?? defaultDevice(devices)?.udid ?? null;
+      const active = target ? (devices.find((device) => device.udid === target && device.state === 'Booted') ?? null) : activeDevice();
+      if (active) {
+        const known = appearances.get(active.udid);
+        if (!known || Date.now() - known.at > APPEARANCE_TTL_MS) appearances.set(active.udid, { value: await readAppearance(active.udid), at: Date.now() });
+        if (!layouts.has(active.udid)) void layoutOf(active.udid).catch(() => undefined);
       }
+      const link = active ? links.peek(active.udid) : undefined;
+      const streaming = target ? !!link?.connected() && links.wanted(target) : !!link?.connected() && links.panelWatching() && panelUdid === active?.udid;
       return {
         devices,
         active,
-        selected,
+        selected: target ?? selected,
         busy,
-        streaming: streamConnected && viewerPresent() && streamUdid === active?.udid,
+        streaming,
         controller,
-        orientation: active ? orientation : null,
-        appearance: active && appearance?.udid === active.udid ? appearance.value : 'unknown',
+        orientation: link?.orientation() ?? null,
+        appearance: active ? (appearances.get(active.udid)?.value ?? 'unknown') : 'unknown',
         keyboard: active ? (layouts.get(active.udid) ?? null) : null,
         framed,
         quality,
@@ -335,12 +253,12 @@ export const createSimulator = () => {
       };
     },
 
-    /** Shows `udid`, booting it first when it is not running. Other running devices keep running. */
-    async boot(udid: string) {
+    /** Boots `udid` if it is off. `select` also shows it in the panel (the panel's own picker). */
+    async boot(udid: string, { select = true }: { select?: boolean } = {}) {
       await refreshDevices(true);
       const device = devices.find((candidate) => candidate.udid === udid);
       if (!device) throw new Error('Unknown device');
-      selected = udid;
+      if (select) selected = udid;
       if (device.state !== 'Booted') {
         await runBusy('booting', () => bootDevice(udid));
         helperPorts.delete(udid); // a helper left from an earlier boot of this device is gone
@@ -348,33 +266,15 @@ export const createSimulator = () => {
       await switchStream();
     },
 
-    /** Shuts down the device shown, nothing else. */
-    async shutdown() {
+    /** Shuts down `udid`, or the panel's device; nothing else. */
+    async shutdown(udid?: string) {
       await refreshDevices(true);
-      const device = activeDevice();
+      const device = udid ? devices.find((candidate) => candidate.udid === udid && candidate.state === 'Booted') : activeDevice();
       if (!device) return;
       await runBusy('shutting-down', async () => {
-        stopStream();
-        closeHid();
+        links.peek(device.udid)?.reset();
         await shutdownDevice(device.udid);
         helperPorts.delete(device.udid); // its helper exits with it
-      });
-    },
-
-    /** Repairs the shown device's input (closes its running apps) and reconnects through a fresh helper. */
-    async repairInput() {
-      const device = await requireActive();
-      await runBusy('repairing', async () => {
-        const port = await repairInput(device.udid, {
-          serveSim: (args) => run(SERVE_SIM, args, { timeout: 120_000 }),
-          restartHelper: async (udid) => {
-            stopStream();
-            closeHid();
-            helperPorts.delete(udid);
-            return restartHelper(udid);
-          },
-        });
-        helperPorts.set(device.udid, port);
       });
       await switchStream();
     },
@@ -410,65 +310,98 @@ export const createSimulator = () => {
       framed = on;
     },
 
+    /** The device the panel shows, from the last device list (no refresh). */
+    active: (): Device | null => activeDevice(),
+
+    /** Is `udid` a listed device (fresh list)? */
+    async knows(udid: string): Promise<boolean> {
+      return (await refreshDevices(true)).some((device) => device.udid === udid);
+    },
+
+    /** A listed device by udid, from the last device list. */
+    device: (udid: string): Device | null => devices.find((device) => device.udid === udid) ?? null,
+
     /** Booted devices, from a device list at most one poll old. */
     async booted(): Promise<Device[]> {
       return (await refreshDevices()).filter((device) => device.state === 'Booted');
     },
 
-    /** The device shown, from the last device list (no refresh). */
-    active: (): Device | null => activeDevice(),
+    /** The newest picture of `udid` (page input checks its size against it). */
+    currentOf: (udid: string): Frame | null => links.peek(udid)?.hub.current() ?? null,
 
-    async button(name: 'home' | 'lock') {
-      await sendRaw(OPCODE.button, name === 'home' ? { button: 'home' } : { button: 'power', page: 12, usage: 48 });
+    async button(name: 'home' | 'lock', udid?: string) {
+      await (await linkOf(udid)).sendRaw(OPCODE.button, name === 'home' ? { button: 'home' } : { button: 'power', page: 12, usage: 48 });
     },
 
-    async rotate(target?: Orientation) {
-      const next: Orientation = target ?? (orientation === 'portrait' || orientation === null ? 'landscape_left' : 'portrait');
-      await sendRaw(OPCODE.orientation, { orientation: next });
-      orientation = next;
+    async rotate(target?: Orientation, udid?: string) {
+      const link = await linkOf(udid);
+      const now = link.orientation();
+      const next: Orientation = target ?? (now === 'portrait' || now === null ? 'landscape_left' : 'portrait');
+      await link.sendRaw(OPCODE.orientation, { orientation: next });
+      link.setOrientation(next);
       // A still screen may send no new frame; republish the current one so it shows rotated.
-      const shown = hub.current();
-      if (shown) hub.publish({ data: shown.data, mime: shown.mime, width: shown.width, height: shown.height, title: shown.title });
+      if (link.udid === panelUdid) {
+        const shown = hub.current();
+        if (shown) hub.publish({ data: shown.data, mime: shown.mime, width: shown.width, height: shown.height, title: shown.title });
+      }
+      const own = link.hub.current();
+      if (own) link.hub.publish({ data: own.data, mime: own.mime, width: own.width, height: own.height, title: own.title });
     },
 
     /** A hardware button from the device frame, by its HID usage (as in Xcode's chrome.json). */
-    async pressButton(name: string, page: number, usage: number) {
-      if (name === 'home') await sendRaw(OPCODE.button, { button: 'home' });
-      else await sendRaw(OPCODE.button, { button: name, page, usage });
+    async pressButton(name: string, page: number, usage: number, udid?: string) {
+      const link = await linkOf(udid);
+      if (name === 'home') await link.sendRaw(OPCODE.button, { button: 'home' });
+      else await link.sendRaw(OPCODE.button, { button: name, page, usage });
     },
 
-    async setAppearance(mode?: 'light' | 'dark') {
-      const device = await requireActive();
+    async setAppearance(mode?: 'light' | 'dark', udid?: string) {
+      const device = await requireDevice(udid);
       const current = await readAppearance(device.udid);
       const next = mode ?? (current === 'dark' ? 'light' : 'dark');
       await setAppearance(device.udid, next);
-      appearance = { udid: device.udid, value: next, at: Date.now() };
+      appearances.set(device.udid, { value: next, at: Date.now() });
+    },
+
+    /** Repairs the input of `udid`, or the panel's device (closes its running apps), and reconnects through a fresh helper. */
+    async repairInput(udid?: string) {
+      const device = await requireDevice(udid);
+      await runBusy('repairing', async () => {
+        const port = await repairInput(device.udid, {
+          serveSim: (args) => run(SERVE_SIM, args, { timeout: 120_000 }),
+          restartHelper: async (target) => {
+            links.peek(target)?.reset();
+            helperPorts.delete(target);
+            return restartHelper(target);
+          },
+        });
+        helperPorts.set(device.udid, port);
+      });
+      await switchStream();
     },
 
     async activeUdid(): Promise<string> {
-      return (await requireActive()).udid;
+      return (await requireDevice()).udid;
     },
 
     async axTree(): Promise<string> {
-      const device = await requireActive();
+      const device = await requireDevice();
       const port = await helperFor(device.udid);
       const response = await fetch(`${helperBase(port, device.udid)}/ax`, { signal: AbortSignal.timeout(15_000) });
       if (!response.ok) throw new Error(`Accessibility tree unavailable (${response.status})`);
       return response.text();
     },
 
-    orientation: (): Orientation | null => orientation,
+    /** Orientation of `udid`, or of the panel's device. */
+    orientation: (udid?: string): Orientation | null => {
+      const target = udid ?? panelUdid;
+      return target ? (links.peek(target)?.orientation() ?? null) : null;
+    },
 
-    /** Keyboard layout of the active device, read once per device. */
-    async layout(): Promise<KeyboardLayout> {
-      const active = activeDevice();
-      if (!active) return 'us';
-      let layout = layouts.get(active.udid);
-      if (!layout) {
-        layout = await readKeyboardLayout(active.udid);
-        layouts.set(active.udid, layout);
-      }
-      return layout;
+    /** Keyboard layout of `udid`, or of the panel's device; read once per device. */
+    async layout(udid?: string): Promise<KeyboardLayout> {
+      const target = udid ?? activeDevice()?.udid;
+      return target ? layoutOf(target) : 'us';
     },
 
     setController(next: SimState['controller']) {
@@ -476,9 +409,7 @@ export const createSimulator = () => {
     },
 
     stop() {
-      if (reconnectTimer) clearTimeout(reconnectTimer);
-      stopStream();
-      closeHid();
+      links.closeAll();
     },
   };
 };

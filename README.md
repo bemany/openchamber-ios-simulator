@@ -17,6 +17,7 @@ The screenshots come from the preview harness (`bun run preview`), which draws t
 ## Features
 
 - **Devices**: every available iPhone and iPad. Picking a running device switches the picture at once. Picking one that is off shows it as off with a **Boot** button: nothing boots until you click it. Several simulators may run at once; the power button shuts down only the device shown.
+- **Several simulators side by side**: the full-screen page shows up to four tiles, each a live simulator of its own. **+** in a tile's corner adds one, **×** closes it (the simulator keeps running). A click makes a tile the focused one: touch, keys and paste go to it, and the toolbar shows and acts on its device; the device picker there changes the tile, not the panel. The page remembers its tiles. A device that is off shows a **Boot** button in its tile and never boots by itself. The rail panel keeps showing one simulator (OpenChamber gives an extension one shared surface).
 - **Toolbar**: Home, Rotate, Light/Dark, Lock, device frame on/off, picture size (**1:1**, **1:2**, **1:3**), and **Open in serve-sim**.
 - **Picture size**: full, half (default) or a third per side. Smaller is smoother, above all over the network. Frame, page and input follow the size.
 - **Device frame**: Xcode's own frame for the device, read from the Xcode installed on the machine; nothing is shipped. Its buttons can be clicked (volume, action, side button).
@@ -36,6 +37,16 @@ Measured with `node scripts/bench.mjs` on the machine running the simulator (18-
 | Plain, full size | 24.0 fps, 154 KB | 28.7 fps, 153 KB |
 | Plain, half size | n/a | 26.3 fps, 29 KB |
 | Framed, a third | n/a | 28.5 fps, 24 KB |
+
+Page tiles (`BENCH_TILES`, framed, half size, 10 s, pictures per second per tile including the blob reads the page does; two throwaway iPhones turning, two other devices idle; measured while the machine was busy with other builds, so expect more on an idle one):
+
+| Tiles | Pictures per second per tile |
+|---|---|
+| 1 | 10.4 |
+| 2 | 8.4 and 8.1 |
+| 4 (2 turning, 2 idle) | 6.0 and 6.1 turning, 2.7 idle |
+
+Every tile is its own stream and its own shrink and encode, so the service's CPU grows with the tiles (about half a core for one or two, close to one core for four in a second, busier run).
 
 Before: one frame size, two compose workers, jpeg-js. After: shrinking in 2 to 4 workers by core count, MozJPEG for shrunk pictures. Over a network the smaller frames matter most: 1.1 MB/s instead of 2.7 MB/s for the framed picture.
 
@@ -83,6 +94,7 @@ node scripts/smoke.mjs              # start the built service like OpenChamber a
 node scripts/bench.mjs              # frames per second and size per mode (turns the device shown)
 node scripts/gap.mjs                # longest picture pause when a helper dies or another simulator shuts down
 node scripts/switch.mjs             # time to switch between two running devices (SWITCH_A, SWITCH_B)
+BENCH_TILES=<udid>,<udid> node scripts/bench.mjs   # page tiles side by side (BENCH_TURN turns those devices)
 bun scripts/build-layouts.ts        # regenerate the keyboard tables from macOS's own layouts (needs swift)
 bun scripts/discover-layout.ts      # read a layout key by key from a throwaway simulator, to check a table
 bun run preview                     # stand-in host on http://127.0.0.1:4790/<random>/, page at <random>/page
@@ -128,6 +140,7 @@ All behind the host's token, on `127.0.0.1`:
 | `GET /state`, `GET /stats` | devices, device shown, stream, orientation, appearance, keyboard, frame, picture size; frame counters for the bench |
 | `POST /select` `{ udid }`, `POST /boot` `{ udid }`, `POST /shutdown` | show a device; boot it (only on request); shut down the device shown |
 | `POST /button` `{ name, page?, usage? }`, `POST /rotate`, `POST /appearance` | toolbar actions and frame buttons |
+| `GET /page/frame?udid=`, `POST /page/input` `{ udid }`, `GET /state?udid=`, `GET /chrome?udid=` | a page tile's own device; actions (`/button`, `/rotate`, `/appearance`, `/repair-input`, `/shutdown`) take `udid` too, `/boot` with `select: false` boots without moving the panel |
 | `GET /serve-sim/servers`, `GET /serve-sim/check?url=` | serve-sim preview servers on this machine, and whether the stored address answers (read only) |
 | `POST /repair-input` | `serve-sim repair-input` for the device shown, then one fresh loopback helper (the device's other loopback helpers are stopped) |
 | `POST /frame` `{ on }`, `POST /frame-style` `{ background }`, `POST /quality` `{ value }` | device frame, colour behind it, picture size (`full`, `balanced`, `fast`) |
@@ -167,7 +180,7 @@ All behind the host's token, on `127.0.0.1`:
 
 ## Deutsch
 
-OpenChamber-Extension, die den iOS-Simulator der Maschine, auf der OpenChamber läuft, live im echten Xcode-Geräterahmen zeigt und bedienbar macht: Tippen, Wischen, Scrollen, Tastatur, Einfügen und die Tasten am Rahmen. Rail-Panel mit Leiste, Vollbild-Seite (Extension pages) und Statusabschnitt. Bildgröße 1:1, 1:2 (Standard) oder 1:3; halbe Größe mit Rahmen läuft mit knapp 28 Bildern pro Sekunde bei 41 KB pro Bild. Ein laufendes Gerät zu wählen schaltet sofort um; ein ausgeschaltetes bootet erst nach Klick auf **Starten**. **In serve-sim öffnen** öffnet eine selbst eingetragene serve-sim-Adresse in einem eigenen Tab (nur im eigenen Netz, nicht über das Relay; serve-sims Seite enthält eine Shell-Route). Beim Eintragen schlägt die Zeile laufende serve-sim-Server auf dem Rechner vor; ein roter Punkt am Knopf zeigt, dass unter der gespeicherten Adresse kein serve-sim antwortet. Die Extension selbst bindet serve-sim nur an `127.0.0.1`. Kommt Tippen nicht mehr an, repariert der Schraubenschlüssel die Eingabe (zweimal klicken; schließt die laufenden Apps). Kopieren und Einfügen über die Simulator-Zwischenablage, wenn sie mitspielt (ohne Simulator.app meist nicht; dann wird getippt und die Leiste meldet ausgelassene Zeichen). Tastatur: Deutsch, US, Britisch, Französisch, Spanisch, Schweizerdeutsch und Italienisch, mit Akzenten über Tottasten. Die Oberfläche ist auf Deutsch, wenn OpenChamber auf Deutsch läuft.
+OpenChamber-Extension, die den iOS-Simulator der Maschine, auf der OpenChamber läuft, live im echten Xcode-Geräterahmen zeigt und bedienbar macht: Tippen, Wischen, Scrollen, Tastatur, Einfügen und die Tasten am Rahmen. Rail-Panel mit Leiste, Vollbild-Seite (Extension pages) und Statusabschnitt. Bildgröße 1:1, 1:2 (Standard) oder 1:3; halbe Größe mit Rahmen läuft mit knapp 28 Bildern pro Sekunde bei 41 KB pro Bild. Ein laufendes Gerät zu wählen schaltet sofort um; ein ausgeschaltetes bootet erst nach Klick auf **Starten**. **In serve-sim öffnen** öffnet eine selbst eingetragene serve-sim-Adresse in einem eigenen Tab (nur im eigenen Netz, nicht über das Relay; serve-sims Seite enthält eine Shell-Route). Beim Eintragen schlägt die Zeile laufende serve-sim-Server auf dem Rechner vor; ein roter Punkt am Knopf zeigt, dass unter der gespeicherten Adresse kein serve-sim antwortet. Die Extension selbst bindet serve-sim nur an `127.0.0.1`. Die Vollbild-Seite zeigt bis zu vier Simulatoren nebeneinander, jeden live und bedienbar (+ und × in der Kachelecke; die angeklickte Kachel bekommt Tastatur und Leiste); das Panel bleibt bei einem. Kommt Tippen nicht mehr an, repariert der Schraubenschlüssel die Eingabe (zweimal klicken; schließt die laufenden Apps). Kopieren und Einfügen über die Simulator-Zwischenablage, wenn sie mitspielt (ohne Simulator.app meist nicht; dann wird getippt und die Leiste meldet ausgelassene Zeichen). Tastatur: Deutsch, US, Britisch, Französisch, Spanisch, Schweizerdeutsch und Italienisch, mit Akzenten über Tottasten. Die Oberfläche ist auf Deutsch, wenn OpenChamber auf Deutsch läuft.
 
 ## License
 
