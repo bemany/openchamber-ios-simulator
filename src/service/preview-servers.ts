@@ -11,7 +11,9 @@ import { networkInterfaces, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import type { OwnAddress } from '../shared/state.ts';
-import { childEnv, SERVE_SIM } from './exec.ts';
+import { childEnv, run, SERVE_SIM } from './exec.ts';
+
+const PS = ['/bin/ps', 'ps'];
 import { PREVIEW_PORTS } from './serve-sim-servers.ts';
 
 export type StartedPreview = { pid: number; url: string; udid: string };
@@ -40,6 +42,8 @@ export type PreviewDeps = {
   /** Does serve-sim at `url` answer its health route for `udid`? */
   probe: (url: string, udid: string) => Promise<boolean>;
   alive: (pid: number) => boolean;
+  /** The command line of `pid`, or `null` when it does not run. */
+  commandOf: (pid: number) => Promise<string | null>;
   kill: (pid: number) => void;
   readRecord: () => StartedPreview[];
   writeRecord: (list: StartedPreview[]) => void;
@@ -56,56 +60,92 @@ export class PreviewError extends Error {
   }
 }
 
+/** How long a stopped server may take to end. */
+const STOP_WAIT_MS = 3_000;
+
+/**
+ * Is `command` the serve-sim we started for `entry`? A pid alone is not
+ * enough: pids get reused, so the command line must name the device, address and port.
+ */
+export const isOurServer = (entry: StartedPreview, command: string | null): boolean => {
+  if (!command) return false;
+  const url = new URL(entry.url);
+  const tokens = command.trim().split(/\s+/);
+  const value = (flag: string) => tokens[tokens.indexOf(flag) + 1];
+  return (
+    tokens.some((token) => token === 'serve-sim' || token.endsWith('/serve-sim')) &&
+    tokens.includes(entry.udid) &&
+    tokens.includes('--host') &&
+    value('--host') === url.hostname &&
+    tokens.includes('--port') &&
+    value('--port') === url.port
+  );
+};
+
 export const createPreviews = (deps: PreviewDeps) => {
-  /** The record without servers whose process is gone. */
-  const started = (): StartedPreview[] => {
+  /** Starts one after the other, so two never pick the same port or overwrite each other's record. */
+  let queue: Promise<unknown> = Promise.resolve();
+
+  /** The record without servers that no longer run as recorded (gone, or the pid now belongs to something else). */
+  const started = async (): Promise<StartedPreview[]> => {
     const list = deps.readRecord();
-    const living = list.filter((entry) => deps.alive(entry.pid));
+    const checked = await Promise.all(list.map(async (entry) => (deps.alive(entry.pid) && isOurServer(entry, await deps.commandOf(entry.pid)) ? entry : null)));
+    const living = checked.filter((entry): entry is StartedPreview => entry !== null);
     if (living.length !== list.length) deps.writeRecord(living);
     return living;
+  };
+
+  const startNow = async (address: string, udid: string): Promise<StartedPreview> => {
+    let port: number | null = null;
+    for (const candidate of PREVIEW_PORTS) {
+      // Also the wildcard address: a server on 0.0.0.0 holds the port for every address.
+      if ((await deps.portFree(address, candidate)) && (await deps.portFree('0.0.0.0', candidate))) {
+        port = candidate;
+        break;
+      }
+    }
+    if (port === null) throw new PreviewError(`No free port ${PREVIEW_PORTS[0]}-${PREVIEW_PORTS[PREVIEW_PORTS.length - 1]} on ${address}`, 409);
+    const pid = deps.launch(udid, address, port);
+    if (pid === undefined) throw new PreviewError('serve-sim did not start', 500);
+    const entry = { pid, url: `http://${address}:${port}`, udid };
+    // Accepted only when it answers and the answering process is still ours, twice in a row.
+    let confirmed = 0;
+    for (const deadline = Date.now() + deps.startTimeoutMs; Date.now() < deadline; ) {
+      await deps.sleep(500);
+      if (!deps.alive(pid)) break;
+      const ours = (await deps.probe(entry.url, udid)) && deps.alive(pid) && isOurServer(entry, await deps.commandOf(pid));
+      confirmed = ours ? confirmed + 1 : 0;
+      if (confirmed >= 2) {
+        deps.writeRecord([...(await started()).filter((other) => other.url !== entry.url), entry]);
+        return entry;
+      }
+    }
+    deps.kill(pid);
+    throw new PreviewError('serve-sim did not answer (log: $TMPDIR/openchamber-ios-simulator-serve-sim.log)', 500);
   };
 
   return {
     started,
 
     /** Starts `serve-sim <udid> --host <address>` on the first free preview port; answers its address once it answers. */
-    async start(address: unknown, udid: string): Promise<StartedPreview> {
+    start(address: unknown, udid: string): Promise<StartedPreview> {
       if (typeof address !== 'string' || !deps.addresses().some((own) => own.address === address)) {
-        throw new PreviewError('Not an address of this machine', 400);
+        return Promise.reject(new PreviewError('Not an address of this machine', 400));
       }
-      let port: number | null = null;
-      for (const candidate of PREVIEW_PORTS) {
-        if (await deps.portFree(address, candidate)) {
-          port = candidate;
-          break;
-        }
-      }
-      if (port === null) throw new PreviewError(`No free port ${PREVIEW_PORTS[0]}-${PREVIEW_PORTS[PREVIEW_PORTS.length - 1]} on ${address}`, 409);
-      const pid = deps.launch(udid, address, port);
-      if (pid === undefined) throw new PreviewError('serve-sim did not start', 500);
-      const url = `http://${address}:${port}`;
-      for (const deadline = Date.now() + deps.startTimeoutMs; Date.now() < deadline; ) {
-        await deps.sleep(500);
-        if (!deps.alive(pid)) break;
-        if (await deps.probe(url, udid)) {
-          const entry = { pid, url, udid };
-          deps.writeRecord([...started().filter((other) => other.url !== url), entry]);
-          return entry;
-        }
-      }
-      deps.kill(pid);
-      throw new PreviewError('serve-sim did not answer (log: $TMPDIR/openchamber-ios-simulator-serve-sim.log)', 500);
+      const run = queue.then(() => startNow(address, udid));
+      queue = run.catch(() => undefined);
+      return run;
     },
 
-    /** Ends a server the extension started; anything else is 404. */
-    async stop(url: unknown, booted: string[]): Promise<void> {
-      const list = started();
+    /** Ends a server the extension started; anything else is 404. The record is kept until the process has ended. */
+    async stop(url: unknown): Promise<void> {
+      const list = await started();
       const entry = list.find((candidate) => candidate.url === url);
       if (!entry) throw new PreviewError('Not a server this extension started', 404);
-      // Only while it still answers as serve-sim: a recorded pid may have been reused since.
-      const answers = (await Promise.all(booted.map((udid) => deps.probe(entry.url, udid)))).some(Boolean);
-      if (answers) deps.kill(entry.pid);
-      deps.writeRecord(list.filter((candidate) => candidate !== entry));
+      deps.kill(entry.pid);
+      for (const deadline = Date.now() + STOP_WAIT_MS; deps.alive(entry.pid) && Date.now() < deadline; ) await deps.sleep(100);
+      if (deps.alive(entry.pid)) throw new PreviewError('serve-sim is still running; try Stop again', 409);
+      deps.writeRecord(deps.readRecord().filter((candidate) => candidate.url !== entry.url));
     },
   };
 };
@@ -153,6 +193,10 @@ export const previewDeps = (probe: PreviewDeps['probe']): PreviewDeps => ({
     } catch {
       return false;
     }
+  },
+  commandOf: async (pid) => {
+    const result = await run(PS, ['-p', String(pid), '-o', 'command='], { timeout: 5_000 });
+    return result.ok && result.stdout.trim() ? result.stdout.trim() : null;
   },
   kill: (pid) => {
     try {

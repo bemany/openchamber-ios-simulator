@@ -75,11 +75,14 @@ export const createDirectEditor = ({ bar, host, toolbar, onToggle }: DirectEdito
   let state: SimState | null = null;
   let search = 0;
   let armed: ReturnType<typeof setTimeout> | null = null;
+  /** The address and device the warning was shown for: the second click starts exactly that. */
+  let armedFor = '';
   let starting = false;
 
   const disarm = () => {
     if (armed) clearTimeout(armed);
     armed = null;
+    armedFor = '';
   };
 
   /** The start part and the hint, for the device shown now. */
@@ -200,10 +203,17 @@ export const createDirectEditor = ({ bar, host, toolbar, onToggle }: DirectEdito
     show(false);
   });
   close.addEventListener('click', () => show(false));
+  addressPick.addEventListener('change', () => {
+    disarm();
+    drawStart();
+  });
   startButton.addEventListener('click', () => {
     const device = state?.active;
     if (!device || starting) return;
+    const choice = `${addressPick.value}|${device.udid}`;
+    if (armed && armedFor !== choice) disarm();
     if (!armed) {
+      armedFor = choice;
       // First click: name the risk; only a second click within 4 s starts.
       armed = setTimeout(() => {
         armed = null;
@@ -250,6 +260,8 @@ export const createDirectEditor = ({ bar, host, toolbar, onToggle }: DirectEdito
     /** Texts, and the state whose device a start is for. */
     label(words: FrameContext['t'], next: SimState | null = null) {
       t = words;
+      // Another device now (the page's focus moved): the warning was for the old one.
+      if (armed && next?.active?.udid !== state?.active?.udid) disarm();
       state = next;
       drawStart();
       edit.setAttribute('aria-label', words.directEdit);

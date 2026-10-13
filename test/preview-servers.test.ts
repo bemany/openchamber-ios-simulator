@@ -1,15 +1,16 @@
 import { describe, expect, test } from 'bun:test';
 
-import { createPreviews, ownAddresses, type PreviewDeps, type StartedPreview } from '../src/service/preview-servers.ts';
+import { createPreviews, isOurServer, ownAddresses, type PreviewDeps, type StartedPreview } from '../src/service/preview-servers.ts';
 import { parseServeSimProcesses, processesFor } from '../src/service/serve-sim-processes.ts';
 import { serveSimsDoubled } from '../src/shared/state.ts';
 
 const PHONE = '11111111-2222-3333-4444-555555555555';
 
-/** A fake machine: `busy` ports are taken; launched servers answer after `answerAfter` probes. */
-const world = (options: { busy?: string[]; answerAfter?: number; dies?: boolean } = {}) => {
+/** A fake machine: `busy` ports are taken; launched servers answer after `answerAfter` probes; `sticky` pids ignore SIGTERM. */
+const world = (options: { busy?: string[]; answerAfter?: number; dies?: boolean; sticky?: boolean } = {}) => {
   let record: StartedPreview[] = [];
   const living = new Set<number>();
+  const commands = new Map<number, string>();
   const answering = new Set<string>();
   const killed: number[] = [];
   const launched: string[] = [];
@@ -20,22 +21,24 @@ const world = (options: { busy?: string[]; answerAfter?: number; dies?: boolean 
       { address: '100.64.1.2', interface: 'utun4' },
       { address: '127.0.0.1', interface: 'lo0' },
     ],
-    portFree: async (address, port) => !(options.busy ?? []).includes(`${address}:${port}`),
+    portFree: async (address, port) => !(options.busy ?? []).includes(`${address}:${port}`) && !launched.some((entry) => entry.endsWith(`${address}:${port}`)),
     launch: (udid, address, port) => {
       nextPid += 1;
       launched.push(`${udid} ${address}:${port}`);
+      commands.set(nextPid, `node /opt/homebrew/bin/serve-sim ${udid} --host ${address} --port ${port} --exit-on-simulator-shutdown`);
       if (!options.dies) living.add(nextPid);
       return nextPid;
     },
     probe: async (url) => {
       probes += 1;
       if (probes > (options.answerAfter ?? 0)) for (const entry of launched) answering.add(`http://${entry.split(' ')[1]}`);
-      return answering.has(url) && [...living].length > 0;
+      return answering.has(url) && living.size > 0;
     },
     alive: (pid) => living.has(pid),
+    commandOf: async (pid) => (living.has(pid) ? (commands.get(pid) ?? null) : null),
     kill: (pid) => {
       killed.push(pid);
-      living.delete(pid);
+      if (!options.sticky) living.delete(pid);
     },
     readRecord: () => record,
     writeRecord: (list) => {
@@ -44,7 +47,7 @@ const world = (options: { busy?: string[]; answerAfter?: number; dies?: boolean 
     sleep: async () => undefined,
     startTimeoutMs: 50,
   };
-  return { deps, killed, launched, record: () => record, living };
+  return { deps, killed, launched, record: () => record, living, commands };
 };
 
 describe('starting preview servers', () => {
@@ -81,17 +84,53 @@ describe('starting preview servers', () => {
     expect(killed).toEqual([501]);
   });
 
-  test('stop ends only a recorded server; others are 404; dead entries drop out of the record', async () => {
-    const { deps, killed, record, living } = world();
+  test('stop ends only a recorded server; others are 404', async () => {
+    const { deps, killed, record } = world();
     const previews = createPreviews(deps);
     const entry = await previews.start('127.0.0.1', PHONE);
-    await expect(previews.stop('http://127.0.0.1:3299', [PHONE])).rejects.toMatchObject({ status: 404 });
-    await previews.stop(entry.url, [PHONE]);
+    await expect(previews.stop('http://127.0.0.1:3299')).rejects.toMatchObject({ status: 404 });
+    await previews.stop(entry.url);
     expect(killed).toEqual([entry.pid]);
     expect(record()).toEqual([]);
-    deps.writeRecord([{ pid: 9999, url: 'http://127.0.0.1:3205', udid: PHONE }]);
-    expect(living.has(9999)).toBe(false);
-    expect(previews.started()).toEqual([]);
+  });
+
+  test('a server that does not end on Stop stays recorded, so Stop can be tried again', async () => {
+    const { deps, record } = world({ sticky: true });
+    const previews = createPreviews(deps);
+    const entry = await previews.start('127.0.0.1', PHONE);
+    await expect(previews.stop(entry.url)).rejects.toMatchObject({ status: 409 });
+    expect(record()).toEqual([entry]);
+  });
+
+  test('a recorded pid that now runs something else is dropped, never stopped', async () => {
+    const { deps, killed, commands } = world();
+    const previews = createPreviews(deps);
+    const entry = await previews.start('127.0.0.1', PHONE);
+    commands.set(entry.pid, '/usr/bin/some-other-program --port 3200');
+    expect(await previews.started()).toEqual([]);
+    await expect(previews.stop(entry.url)).rejects.toMatchObject({ status: 404 });
+    expect(killed).toEqual([]);
+  });
+
+  test('two starts at once take different ports and both stay recorded', async () => {
+    const { deps, record } = world();
+    const previews = createPreviews(deps);
+    const [first, second] = await Promise.all([previews.start('100.64.1.2', PHONE), previews.start('100.64.1.2', PHONE)]);
+    expect(first.url).not.toBe(second.url);
+    expect(record().map((entry) => entry.url).sort()).toEqual([first.url, second.url].sort());
+  });
+
+  test('a port held on the wildcard address counts as busy', async () => {
+    const { deps, launched } = world({ busy: ['0.0.0.0:3200'] });
+    await createPreviews(deps).start('100.64.1.2', PHONE);
+    expect(launched).toEqual([`${PHONE} 100.64.1.2:3201`]);
+  });
+
+  test('the command line must name the recorded device, address and port', () => {
+    const entry = { pid: 1, url: 'http://100.64.1.2:3200', udid: PHONE };
+    expect(isOurServer(entry, `node /opt/homebrew/bin/serve-sim ${PHONE} --host 100.64.1.2 --port 3200 --exit-on-simulator-shutdown`)).toBe(true);
+    expect(isOurServer(entry, `node /opt/homebrew/bin/serve-sim ${PHONE} --host 100.64.1.2 --port 3201`)).toBe(false);
+    expect(isOurServer(entry, null)).toBe(false);
   });
 
   test('a preview the extension started counts as its own: no warning next to its helper', () => {

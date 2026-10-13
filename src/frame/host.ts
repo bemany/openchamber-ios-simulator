@@ -80,15 +80,22 @@ export const startFrame = (render: (context: FrameContext) => void, options: Fra
     timer = setTimeout(poll, busy || pending ? POLL_BUSY_MS : POLL_MS);
   };
 
+  /** The device the toolbar is about now (the page's focused tile), `null` for the panel's. */
+  const targetNow = () => options.target?.() ?? null;
+
   async function poll() {
+    const asked = targetNow();
+    let next: ViewState;
     try {
-      const udid = options.target?.() ?? null;
-      const result = await host.serviceRequest({ method: 'GET', path: '/state', ...(udid ? { query: { udid } } : {}) });
+      const result = await host.serviceRequest({ method: 'GET', path: '/state', ...(asked ? { query: { udid: asked } } : {}) });
       const state = result.status === 200 ? parseState(result.body) : null;
-      view = state ? { kind: 'ready', state } : { kind: 'blocked', reason: 'failed', detail: errorText(result.body).slice(0, 200) };
+      next = state ? { kind: 'ready', state } : { kind: 'blocked', reason: 'failed', detail: errorText(result.body).slice(0, 200) };
     } catch (cause) {
-      view = blockedReason(cause);
+      next = blockedReason(cause);
     }
+    // The focus moved while this was on its way: the answer is about another device.
+    if (asked !== targetNow()) return void poll();
+    view = next;
     draw();
     schedule();
   }
@@ -99,11 +106,11 @@ export const startFrame = (render: (context: FrameContext) => void, options: Fra
     draw();
     schedule();
     try {
-      const udid = options.target?.() ?? null;
+      const udid = targetNow();
       const sent = udid ? { udid, ...body, select: false } : body;
       const result = await host.serviceRequest({ method: 'POST', path, body: JSON.stringify(sent) });
       const state = parseState(result.body);
-      if (state) view = { kind: 'ready', state };
+      if (state && udid === targetNow()) view = { kind: 'ready', state };
       if (result.status >= 400) {
         void host.toast({ kind: 'error', message: errorText(result.body).slice(0, 300) }).catch(() => undefined);
       }

@@ -1555,6 +1555,7 @@ var serverDeps = (booted) => ({
 });
 
 // src/service/preview-servers.ts
+var PS = ["/bin/ps", "ps"];
 var rank = (address) => {
   const [a = 0, b = 0] = address.split(".").map(Number);
   if (a === 100 && b >= 64 && b <= 127)
@@ -1574,55 +1575,77 @@ class PreviewError extends Error {
     this.status = status;
   }
 }
+var STOP_WAIT_MS = 3000;
+var isOurServer = (entry, command) => {
+  if (!command)
+    return false;
+  const url = new URL(entry.url);
+  const tokens = command.trim().split(/\s+/);
+  const value = (flag) => tokens[tokens.indexOf(flag) + 1];
+  return tokens.some((token) => token === "serve-sim" || token.endsWith("/serve-sim")) && tokens.includes(entry.udid) && tokens.includes("--host") && value("--host") === url.hostname && tokens.includes("--port") && value("--port") === url.port;
+};
 var createPreviews = (deps) => {
-  const started = () => {
+  let queue = Promise.resolve();
+  const started = async () => {
     const list = deps.readRecord();
-    const living = list.filter((entry) => deps.alive(entry.pid));
+    const checked = await Promise.all(list.map(async (entry) => deps.alive(entry.pid) && isOurServer(entry, await deps.commandOf(entry.pid)) ? entry : null));
+    const living = checked.filter((entry) => entry !== null);
     if (living.length !== list.length)
       deps.writeRecord(living);
     return living;
   };
+  const startNow = async (address, udid) => {
+    let port = null;
+    for (const candidate of PREVIEW_PORTS) {
+      if (await deps.portFree(address, candidate) && await deps.portFree("0.0.0.0", candidate)) {
+        port = candidate;
+        break;
+      }
+    }
+    if (port === null)
+      throw new PreviewError(`No free port ${PREVIEW_PORTS[0]}-${PREVIEW_PORTS[PREVIEW_PORTS.length - 1]} on ${address}`, 409);
+    const pid = deps.launch(udid, address, port);
+    if (pid === undefined)
+      throw new PreviewError("serve-sim did not start", 500);
+    const entry = { pid, url: `http://${address}:${port}`, udid };
+    let confirmed = 0;
+    for (const deadline = Date.now() + deps.startTimeoutMs;Date.now() < deadline; ) {
+      await deps.sleep(500);
+      if (!deps.alive(pid))
+        break;
+      const ours = await deps.probe(entry.url, udid) && deps.alive(pid) && isOurServer(entry, await deps.commandOf(pid));
+      confirmed = ours ? confirmed + 1 : 0;
+      if (confirmed >= 2) {
+        deps.writeRecord([...(await started()).filter((other) => other.url !== entry.url), entry]);
+        return entry;
+      }
+    }
+    deps.kill(pid);
+    throw new PreviewError("serve-sim did not answer (log: $TMPDIR/openchamber-ios-simulator-serve-sim.log)", 500);
+  };
   return {
     started,
-    async start(address, udid) {
+    start(address, udid) {
       if (typeof address !== "string" || !deps.addresses().some((own) => own.address === address)) {
-        throw new PreviewError("Not an address of this machine", 400);
+        return Promise.reject(new PreviewError("Not an address of this machine", 400));
       }
-      let port = null;
-      for (const candidate of PREVIEW_PORTS) {
-        if (await deps.portFree(address, candidate)) {
-          port = candidate;
-          break;
-        }
-      }
-      if (port === null)
-        throw new PreviewError(`No free port ${PREVIEW_PORTS[0]}-${PREVIEW_PORTS[PREVIEW_PORTS.length - 1]} on ${address}`, 409);
-      const pid = deps.launch(udid, address, port);
-      if (pid === undefined)
-        throw new PreviewError("serve-sim did not start", 500);
-      const url = `http://${address}:${port}`;
-      for (const deadline = Date.now() + deps.startTimeoutMs;Date.now() < deadline; ) {
-        await deps.sleep(500);
-        if (!deps.alive(pid))
-          break;
-        if (await deps.probe(url, udid)) {
-          const entry = { pid, url, udid };
-          deps.writeRecord([...started().filter((other) => other.url !== url), entry]);
-          return entry;
-        }
-      }
-      deps.kill(pid);
-      throw new PreviewError("serve-sim did not answer (log: $TMPDIR/openchamber-ios-simulator-serve-sim.log)", 500);
+      const run = queue.then(() => startNow(address, udid));
+      queue = run.catch(() => {
+        return;
+      });
+      return run;
     },
-    async stop(url, booted) {
-      const list = started();
+    async stop(url) {
+      const list = await started();
       const entry = list.find((candidate) => candidate.url === url);
       if (!entry)
         throw new PreviewError("Not a server this extension started", 404);
-      const answers = (await Promise.all(booted.map((udid) => deps.probe(entry.url, udid)))).some(Boolean);
-      if (answers)
-        deps.kill(entry.pid);
-      deps.writeRecord(list.filter((candidate) => candidate !== entry));
+      deps.kill(entry.pid);
+      for (const deadline = Date.now() + STOP_WAIT_MS;deps.alive(entry.pid) && Date.now() < deadline; )
+        await deps.sleep(100);
+      if (deps.alive(entry.pid))
+        throw new PreviewError("serve-sim is still running; try Stop again", 409);
+      deps.writeRecord(deps.readRecord().filter((candidate) => candidate.url !== entry.url));
     }
   };
 };
@@ -1663,6 +1686,10 @@ var previewDeps = (probe) => ({
     } catch {
       return false;
     }
+  },
+  commandOf: async (pid) => {
+    const result = await run(PS, ["-p", String(pid), "-o", "command="], { timeout: 5000 });
+    return result.ok && result.stdout.trim() ? result.stdout.trim() : null;
   },
   kill: (pid) => {
     try {
@@ -1754,9 +1781,9 @@ var parseServeSimProcesses = (output) => {
 };
 var processesFor = (all, udid, booted, ownPids = new Set) => booted ? all.filter((entry) => entry.devices.length === 0 ? true : entry.devices.includes(udid.toUpperCase())).map(({ pid, host, port, own }) => ({ pid, host, port, own: own || ownPids.has(pid) })) : [];
 var CACHE_MS = 5000;
-var PS = ["/bin/ps", "ps"];
+var PS2 = ["/bin/ps", "ps"];
 var createProcessReader = (read = async () => {
-  const result = await run(PS, ["-axo", "pid=,command="], { timeout: 5000 });
+  const result = await run(PS2, ["-axo", "pid=,command="], { timeout: 5000 });
   return result.ok ? result.stdout : null;
 }) => {
   let cached = null;
@@ -2039,10 +2066,10 @@ var RECONNECT_MS = 300;
 var MIN_TOUCH_MS = 40;
 var KEY_GAP_MS = 8;
 var CONFIG_OPCODE = 130;
+var HID_OPEN_TIMEOUT_MS = 5000;
 var sleep2 = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 var message = (cause) => cause instanceof Error ? cause.message : String(cause);
-var createDeviceLink = (udid, ctx) => {
-  const hub = createFrameHub();
+var createDeviceLink = (udid, ctx, hub = createFrameHub()) => {
   let request = null;
   let connected = false;
   let starting = false;
@@ -2061,10 +2088,12 @@ var createDeviceLink = (udid, ctx) => {
     connected = false;
     old?.destroy();
   };
+  let hidGeneration = 0;
   const closeHid = () => {
     const old = socket;
     socket = null;
     socketOpen = null;
+    hidGeneration += 1;
     orientation = null;
     try {
       old?.close();
@@ -2075,8 +2104,14 @@ var createDeviceLink = (udid, ctx) => {
       return socket;
     if (socketOpen)
       return socketOpen;
+    if (closed)
+      throw new Error("The device link is closed");
+    const mine = hidGeneration;
+    const current = () => !closed && mine === hidGeneration;
     socketOpen = (async () => {
       const port = await ctx.helperFor(udid);
+      if (!current())
+        throw new Error("The HID connection was dropped while opening");
       const next = new WebSocket(`${helperBase(port, udid).replace("http:", "ws:")}/ws`);
       next.binaryType = "arraybuffer";
       next.onmessage = (event) => {
@@ -2089,10 +2124,30 @@ var createDeviceLink = (udid, ctx) => {
             orientation = config.orientation;
         } catch {}
       };
-      await new Promise((resolve, reject) => {
-        next.onopen = () => resolve();
-        next.onerror = () => reject(new Error("Could not open the HID connection to serve-sim"));
-      });
+      try {
+        await new Promise((resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error("The HID connection to serve-sim did not open")), HID_OPEN_TIMEOUT_MS);
+          next.onopen = () => {
+            clearTimeout(timer);
+            resolve();
+          };
+          next.onerror = () => {
+            clearTimeout(timer);
+            reject(new Error("Could not open the HID connection to serve-sim"));
+          };
+          next.onclose = () => {
+            clearTimeout(timer);
+            reject(new Error("The HID connection closed while opening"));
+          };
+        });
+      } catch (cause) {
+        next.close();
+        throw cause;
+      }
+      if (!current()) {
+        next.close();
+        throw new Error("The HID connection was dropped while opening");
+      }
       next.onclose = () => {
         ctx.forgetHelper(udid);
         if (socket === next)
@@ -2104,7 +2159,8 @@ var createDeviceLink = (udid, ctx) => {
     try {
       return await socketOpen;
     } catch (cause) {
-      closeHid();
+      if (current())
+        closeHid();
       throw cause;
     }
   };
@@ -2114,6 +2170,8 @@ var createDeviceLink = (udid, ctx) => {
     starting = true;
     let port;
     try {
+      if (!await ctx.booted(udid))
+        return;
       port = await ctx.helperFor(udid);
     } catch (cause) {
       ctx.onError(udid, message(cause));
@@ -2320,7 +2378,7 @@ var SKIPPED_SHOWN_MS = 8000;
 var PLACEHOLDER = { width: 402, height: 874, color: 1907483 };
 var sleep3 = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 var message2 = (cause) => cause instanceof Error ? cause.message : String(cause);
-var createSimulator = (ownPreviewPids = () => new Set) => {
+var createSimulator = (ownPreviewPids = async () => new Set) => {
   const hub = createFrameHub();
   let devices = [];
   let devicesAt = 0;
@@ -2343,6 +2401,20 @@ var createSimulator = (ownPreviewPids = () => new Set) => {
   let placeholderShown = false;
   let watching = false;
   const serveSimProcesses = createProcessReader();
+  const hubs = new Map;
+  const hubOf = (udid) => {
+    let found = hubs.get(udid);
+    if (!found) {
+      found = createFrameHub();
+      hubs.set(udid, found);
+    }
+    return found;
+  };
+  let bootedCheck = null;
+  const bootedNow = async (udid) => {
+    bootedCheck ??= refreshDevices(Date.now() - devicesAt > 1000).finally(() => setTimeout(() => bootedCheck = null, 1000));
+    return (await bootedCheck).some((device) => device.udid === udid && device.state === "Booted");
+  };
   const links = createLinks({
     now: () => Date.now(),
     graceMs: VIEWER_GRACE_MS2,
@@ -2351,6 +2423,7 @@ var createSimulator = (ownPreviewPids = () => new Set) => {
       forgetHelper: (device) => helperPorts.delete(device),
       name: (device) => devices.find((candidate) => candidate.udid === device)?.name ?? "Simulator",
       wanted: (device) => links.wanted(device),
+      booted: bootedNow,
       onFrame: (device, frame) => {
         if (device !== panelUdid)
           return;
@@ -2361,7 +2434,7 @@ var createSimulator = (ownPreviewPids = () => new Set) => {
         if (device === panelUdid || next === null)
           error = next;
       }
-    })
+    }, hubOf(udid))
   });
   const activeDevice = () => shownDevice(devices, selected);
   const booted = (udid) => devices.some((device) => device.udid === udid && device.state === "Booted");
@@ -2522,7 +2595,7 @@ var createSimulator = (ownPreviewPids = () => new Set) => {
         framed,
         quality,
         skipped: Date.now() - skipped.at < SKIPPED_SHOWN_MS ? skipped.count : 0,
-        serveSims: active ? processesFor(await serveSimProcesses(), active.udid, true, ownPreviewPids()) : [],
+        serveSims: active ? processesFor(await serveSimProcesses(), active.udid, true, await ownPreviewPids()) : [],
         error
       };
     },
@@ -2577,7 +2650,9 @@ var createSimulator = (ownPreviewPids = () => new Set) => {
     },
     active: () => activeDevice(),
     async knows(udid) {
-      return (await refreshDevices(true)).some((device) => device.udid === udid);
+      if (!/^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/.test(udid))
+        return false;
+      return (await refreshDevices(Date.now() - devicesAt > 1000)).some((device) => device.udid === udid);
     },
     device: (udid) => devices.find((device) => device.udid === udid) ?? null,
     async booted() {
@@ -2675,7 +2750,7 @@ var ORIENTATIONS = ["portrait", "portrait_upside_down", "landscape_left", "lands
 var PAGE_WAIT_MS = 1e4;
 var DEFAULT_BACKGROUND = [29, 27, 27];
 var previews = createPreviews(previewDeps(probeHealth));
-var sim = createSimulator(() => new Set(previews.started().map((entry) => entry.pid)));
+var sim = createSimulator(async () => new Set((await previews.started()).map((entry) => entry.pid)));
 var servers = serverDeps(() => sim.booted());
 var pasteboard = createPasteboard((args, options) => run(XCRUN, args, options));
 var surfaceInput = { touching: false };
@@ -2999,7 +3074,7 @@ var routes = {
     send(res, 200, await sim.state(udid));
   },
   "GET /serve-sim/servers": async (_req, res) => {
-    const started = new Set(previews.started().map((entry) => entry.url));
+    const started = new Set((await previews.started()).map((entry) => entry.url));
     send(res, 200, { servers: (await findServers(servers)).map((server) => ({ ...server, started: started.has(server.url) })) });
   },
   "GET /serve-sim/addresses": async (_req, res) => send(res, 200, { addresses: ownAddresses() }),
@@ -3014,7 +3089,7 @@ var routes = {
   },
   "POST /serve-sim/stop": async (req, res) => {
     const body = await readJson(req);
-    await previews.stop(body.url, (await sim.booted()).map((device) => device.udid));
+    await previews.stop(body.url);
     sim.forgetProcesses();
     send(res, 200, { ok: true });
   },

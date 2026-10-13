@@ -16,7 +16,6 @@ export type Orientation = 'portrait' | 'portrait_upside_down' | 'landscape_left'
 
 export type Appearance = 'light' | 'dark' | 'unknown';
 
-/** Hardware keyboard layouts the service can type in; anything else is typed as `us`. */
 /** A serve-sim stream process attached to a device (from the process list). `own`: the extension's helper. */
 export type ServeSimProcess = { pid: number; host: string; port: number; own: boolean };
 
@@ -29,6 +28,7 @@ export type ServeSimServer = { url: string; udid: string; name: string; loopback
 /** One of the OpenChamber machine's IPv4 addresses, for starting a preview server on it. */
 export type OwnAddress = { address: string; interface: string };
 
+/** Hardware keyboard layouts the service can type in; anything else is typed as `us`. */
 export type KeyboardLayout = 'ch' | 'de' | 'es' | 'fr' | 'gb' | 'it' | 'us';
 
 export type Busy = 'booting' | 'shutting-down' | 'repairing' | null;

@@ -45,7 +45,7 @@ const PAGE_WAIT_MS = 10_000;
 const DEFAULT_BACKGROUND: [number, number, number] = [0x1d, 0x1b, 0x1b];
 
 const previews = createPreviews(previewDeps(probeHealth));
-const sim = createSimulator(() => new Set(previews.started().map((entry) => entry.pid)));
+const sim = createSimulator(async () => new Set((await previews.started()).map((entry) => entry.pid)));
 const servers = serverDeps(() => sim.booted());
 const pasteboard = createPasteboard((args, options) => run(XCRUN, args, options));
 const surfaceInput: InputState = { touching: false };
@@ -380,7 +380,7 @@ const routes: Record<string, Route> = {
   },
   // For the "Open in serve-sim" address: preview servers on this machine, and whether the stored address answers.
   'GET /serve-sim/servers': async (_req, res) => {
-    const started = new Set(previews.started().map((entry) => entry.url));
+    const started = new Set((await previews.started()).map((entry) => entry.url));
     send(res, 200, { servers: (await findServers(servers)).map((server) => ({ ...server, started: started.has(server.url) })) });
   },
   // Starting a preview server on request (the address row, after a confirmation), and stopping one the extension started.
@@ -395,7 +395,7 @@ const routes: Record<string, Route> = {
   },
   'POST /serve-sim/stop': async (req, res) => {
     const body = await readJson(req);
-    await previews.stop(body.url, (await sim.booted()).map((device) => device.udid));
+    await previews.stop(body.url);
     sim.forgetProcesses();
     send(res, 200, { ok: true });
   },

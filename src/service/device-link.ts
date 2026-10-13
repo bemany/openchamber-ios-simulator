@@ -5,7 +5,7 @@
 import http from 'node:http';
 
 import type { Orientation } from '../shared/state.ts';
-import { createFrameHub, type Frame } from './frames.ts';
+import { createFrameHub, type Frame, type FrameHub } from './frames.ts';
 import { helperBase } from './helper.ts';
 import { encodeHid, encodeMessage, type HidMessage } from './input.ts';
 import { createMjpegParser, jpegSize } from './mjpeg.ts';
@@ -17,6 +17,8 @@ const MIN_TOUCH_MS = 40;
 const KEY_GAP_MS = 8;
 /** serve-sim's HID socket sends the screen config with this opcode. */
 const CONFIG_OPCODE = 130;
+/** A helper that takes the connection but never upgrades it must not hang input forever. */
+const HID_OPEN_TIMEOUT_MS = 5_000;
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const message = (cause: unknown) => (cause instanceof Error ? cause.message : String(cause));
@@ -30,13 +32,15 @@ export type LinkContext = {
   name: (udid: string) => string;
   /** Is someone still watching this device (reconnect after a drop)? */
   wanted: (udid: string) => boolean;
+  /** Does the device run (fresh device list)? A link never starts a helper for a device that is off. */
+  booted: (udid: string) => Promise<boolean>;
   /** Every frame of this device, after it reached the link's own hub. */
   onFrame: (udid: string, frame: Frame) => void;
   onError: (udid: string, error: string | null) => void;
 };
 
-export const createDeviceLink = (udid: string, ctx: LinkContext) => {
-  const hub = createFrameHub();
+/** `hub`: the device's frame hub, kept across links so a viewer's frame numbers stay valid. */
+export const createDeviceLink = (udid: string, ctx: LinkContext, hub: FrameHub = createFrameHub()) => {
   let request: http.ClientRequest | null = null;
   let connected = false;
   let starting = false;
@@ -56,10 +60,14 @@ export const createDeviceLink = (udid: string, ctx: LinkContext) => {
     old?.destroy();
   };
 
+  /** Bumped whenever the HID socket is dropped: an opening that finishes later is thrown away. */
+  let hidGeneration = 0;
+
   const closeHid = () => {
     const old = socket;
     socket = null;
     socketOpen = null;
+    hidGeneration += 1;
     orientation = null;
     try {
       old?.close();
@@ -71,8 +79,12 @@ export const createDeviceLink = (udid: string, ctx: LinkContext) => {
   const openHid = async (): Promise<WebSocket> => {
     if (socket && socket.readyState === WebSocket.OPEN) return socket;
     if (socketOpen) return socketOpen;
+    if (closed) throw new Error('The device link is closed');
+    const mine = hidGeneration;
+    const current = () => !closed && mine === hidGeneration;
     socketOpen = (async () => {
       const port = await ctx.helperFor(udid);
+      if (!current()) throw new Error('The HID connection was dropped while opening');
       const next = new WebSocket(`${helperBase(port, udid).replace('http:', 'ws:')}/ws`);
       next.binaryType = 'arraybuffer';
       next.onmessage = (event) => {
@@ -85,10 +97,31 @@ export const createDeviceLink = (udid: string, ctx: LinkContext) => {
           // not ours to fix
         }
       };
-      await new Promise<void>((resolve, reject) => {
-        next.onopen = () => resolve();
-        next.onerror = () => reject(new Error('Could not open the HID connection to serve-sim'));
-      });
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const timer = setTimeout(() => reject(new Error('The HID connection to serve-sim did not open')), HID_OPEN_TIMEOUT_MS);
+          next.onopen = () => {
+            clearTimeout(timer);
+            resolve();
+          };
+          next.onerror = () => {
+            clearTimeout(timer);
+            reject(new Error('Could not open the HID connection to serve-sim'));
+          };
+          next.onclose = () => {
+            clearTimeout(timer);
+            reject(new Error('The HID connection closed while opening'));
+          };
+        });
+      } catch (cause) {
+        next.close();
+        throw cause;
+      }
+      if (!current()) {
+        // Closed or reset while it opened: this socket is nobody's.
+        next.close();
+        throw new Error('The HID connection was dropped while opening');
+      }
       next.onclose = () => {
         ctx.forgetHelper(udid);
         if (socket === next) closeHid();
@@ -99,7 +132,7 @@ export const createDeviceLink = (udid: string, ctx: LinkContext) => {
     try {
       return await socketOpen;
     } catch (cause) {
-      closeHid();
+      if (current()) closeHid();
       throw cause;
     }
   };
@@ -110,6 +143,8 @@ export const createDeviceLink = (udid: string, ctx: LinkContext) => {
     starting = true;
     let port: number;
     try {
+      // A drop is often the simulator shutting down: never start a helper for a device that is off.
+      if (!(await ctx.booted(udid))) return;
       port = await ctx.helperFor(udid);
     } catch (cause) {
       ctx.onError(udid, message(cause));

@@ -37,7 +37,7 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const message = (cause: unknown) => (cause instanceof Error ? cause.message : String(cause));
 
 /** `ownPreviewPids`: preview servers the extension started on request (they count as its own). */
-export const createSimulator = (ownPreviewPids: () => ReadonlySet<number> = () => new Set()) => {
+export const createSimulator = (ownPreviewPids: () => Promise<ReadonlySet<number>> = async () => new Set()) => {
   /** The panel's pictures: the frames of the device it shows, numbered on across switches, or a placeholder. */
   const hub = createFrameHub();
   let devices: Device[] = [];
@@ -65,6 +65,22 @@ export const createSimulator = (ownPreviewPids: () => ReadonlySet<number> = () =
   let watching = false;
   const serveSimProcesses = createProcessReader();
 
+  /** Frame hubs per device, kept when a link closes, so a tile coming back keeps counting from its last frame. */
+  const hubs = new Map<string, ReturnType<typeof createFrameHub>>();
+  const hubOf = (udid: string) => {
+    let found = hubs.get(udid);
+    if (!found) {
+      found = createFrameHub();
+      hubs.set(udid, found);
+    }
+    return found;
+  };
+  /** At most one forced device list per second for links asking whether their device runs. */
+  let bootedCheck: Promise<Device[]> | null = null;
+  const bootedNow = async (udid: string): Promise<boolean> => {
+    bootedCheck ??= refreshDevices(Date.now() - devicesAt > 1_000).finally(() => setTimeout(() => (bootedCheck = null), 1_000));
+    return (await bootedCheck).some((device) => device.udid === udid && device.state === 'Booted');
+  };
   const links: Links<DeviceLink> = createLinks<DeviceLink>({
     now: () => Date.now(),
     graceMs: VIEWER_GRACE_MS,
@@ -74,6 +90,7 @@ export const createSimulator = (ownPreviewPids: () => ReadonlySet<number> = () =
         forgetHelper: (device) => helperPorts.delete(device),
         name: (device) => devices.find((candidate) => candidate.udid === device)?.name ?? 'Simulator',
         wanted: (device): boolean => links.wanted(device),
+        booted: bootedNow,
         onFrame: (device, frame) => {
           if (device !== panelUdid) return;
           placeholderShown = false;
@@ -82,7 +99,7 @@ export const createSimulator = (ownPreviewPids: () => ReadonlySet<number> = () =
         onError: (device, next) => {
           if (device === panelUdid || next === null) error = next;
         },
-      }),
+      }, hubOf(udid)),
   });
 
   const activeDevice = (): Device | null => shownDevice(devices, selected);
@@ -252,7 +269,7 @@ export const createSimulator = (ownPreviewPids: () => ReadonlySet<number> = () =
         framed,
         quality,
         skipped: Date.now() - skipped.at < SKIPPED_SHOWN_MS ? skipped.count : 0,
-        serveSims: active ? processesFor(await serveSimProcesses(), active.udid, true, ownPreviewPids()) : [],
+        serveSims: active ? processesFor(await serveSimProcesses(), active.udid, true, await ownPreviewPids()) : [],
         error,
       };
     },
@@ -319,7 +336,9 @@ export const createSimulator = (ownPreviewPids: () => ReadonlySet<number> = () =
 
     /** Is `udid` a listed device (fresh list)? */
     async knows(udid: string): Promise<boolean> {
-      return (await refreshDevices(true)).some((device) => device.udid === udid);
+      if (!/^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/.test(udid)) return false;
+      // A tile of a deleted device asks on every frame: a fresh list at most once a second.
+      return (await refreshDevices(Date.now() - devicesAt > 1_000)).some((device) => device.udid === udid);
     },
 
     /** A listed device by udid, from the last device list. */

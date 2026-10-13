@@ -261,6 +261,8 @@ const createTile = (initial: string) => {
 
   let queue: SurfaceInputEvent[] = [];
   let flushing = false;
+  /** The size input was last mapped to, so a pointer-up still reaches the service after the picture went away. */
+  let lastSize: { width: number; height: number } | null = null;
   const sendInput = (event: SurfaceInputEvent) => {
     queue.push(event);
     if (!flushing) void flush();
@@ -268,10 +270,12 @@ const createTile = (initial: string) => {
   async function flush() {
     flushing = true;
     try {
-      while (queue.length > 0 && shown) {
+      while (queue.length > 0) {
+        if (shown) lastSize = { width: shown.width, height: shown.height };
+        if (!lastSize) break;
         const events = queue.splice(0, 256);
         await host
-          .serviceRequest({ method: 'POST', path: '/page/input', body: JSON.stringify({ events, width: shown.width, height: shown.height, udid }) })
+          .serviceRequest({ method: 'POST', path: '/page/input', body: JSON.stringify({ events, ...lastSize, udid }) })
           .catch(() => undefined);
       }
       queue = [];
