@@ -86,7 +86,7 @@ export const isOurServer = (entry: StartedPreview, command: string | null): bool
 const STARTED_CACHE_MS = 1_000;
 
 export const createPreviews = (deps: PreviewDeps) => {
-  /** Starts one after the other, so two never pick the same port or overwrite each other's record. */
+  /** Starts and stops, one after the other. */
   let queue: Promise<unknown> = Promise.resolve();
   let cache: { at: number; list: Promise<StartedPreview[]> } | null = null;
 
@@ -152,8 +152,33 @@ export const createPreviews = (deps: PreviewDeps) => {
       }
     }
     // Only end it while the pid is still the process we launched (it may have ended and been reused).
-    if ((await identity(entry)) === 'ours') deps.kill(pid);
+    const state = await identity(entry);
+    if (state === 'ours') deps.kill(pid);
+    // Could not tell: keep it on record, so a later check drops it or Stop can end it.
+    if (state === 'unknown') write([...deps.readRecord().filter((other) => other.url !== entry.url), entry]);
     throw new PreviewError('serve-sim did not answer (log: $TMPDIR/openchamber-ios-simulator-serve-sim.log)', 500);
+  };
+
+  const stopNow = async (url: unknown): Promise<void> => {
+    const recorded = deps.readRecord().find((candidate) => candidate.url === url);
+    if (!recorded) throw new PreviewError('Not a server this extension started', 404);
+    const same = (candidate: StartedPreview) => candidate.pid === recorded.pid && candidate.url === recorded.url;
+    const state = await identity(recorded);
+    if (state === 'unknown') throw new PreviewError('Could not check the process; try Stop again', 503);
+    if (state === 'ours') {
+      deps.kill(recorded.pid);
+      for (const deadline = Date.now() + STOP_WAIT_MS; deps.alive(recorded.pid) && Date.now() < deadline; ) await deps.sleep(100);
+      if (deps.alive(recorded.pid)) throw new PreviewError('serve-sim is still running; try Stop again', 409);
+    }
+    // Ended now, or already gone: either way it is stopped. Only this entry (pid and url) leaves the record.
+    write(deps.readRecord().filter((candidate) => !same(candidate)));
+  };
+
+  /** Starts and stops run one after the other: neither picks a port or rewrites the record under the other. */
+  const queued = <T>(work: () => Promise<T>): Promise<T> => {
+    const run = queue.then(work);
+    queue = run.catch(() => undefined);
+    return run;
   };
 
   return {
@@ -164,25 +189,11 @@ export const createPreviews = (deps: PreviewDeps) => {
       if (typeof address !== 'string' || !deps.addresses().some((own) => own.address === address)) {
         return Promise.reject(new PreviewError('Not an address of this machine', 400));
       }
-      const run = queue.then(() => startNow(address, udid));
-      queue = run.catch(() => undefined);
-      return run;
+      return queued(() => startNow(address, udid));
     },
 
     /** Ends a server the extension started; anything else is 404. The record is kept until the process has ended. */
-    async stop(url: unknown): Promise<void> {
-      cache = null;
-      const entry = (await started()).find((candidate) => candidate.url === url);
-      if (!entry) throw new PreviewError('Not a server this extension started', 404);
-      const state = await identity(entry);
-      if (state === 'unknown') throw new PreviewError('Could not check the process; try Stop again', 503);
-      if (state === 'ours') {
-        deps.kill(entry.pid);
-        for (const deadline = Date.now() + STOP_WAIT_MS; deps.alive(entry.pid) && Date.now() < deadline; ) await deps.sleep(100);
-        if (deps.alive(entry.pid)) throw new PreviewError('serve-sim is still running; try Stop again', 409);
-      }
-      write(deps.readRecord().filter((candidate) => candidate.url !== entry.url));
-    },
+    stop: (url: unknown): Promise<void> => queued(() => stopNow(url)),
   };
 };
 
@@ -199,7 +210,7 @@ const readRecord = (): StartedPreview[] => {
   }
 };
 
-const portFree = (address: string, port: number): Promise<boolean> =>
+export const portFree = (address: string, port: number): Promise<boolean> =>
   new Promise((resolve) => {
     const server = createServer();
     // Only "in use" means taken; a wildcard the machine cannot bind (no IPv6) says nothing about the port.

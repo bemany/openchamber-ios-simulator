@@ -1,6 +1,8 @@
 import { describe, expect, test } from 'bun:test';
 
-import { createPreviews, isOurServer, ownAddresses, type PreviewDeps, type StartedPreview } from '../src/service/preview-servers.ts';
+import { createServer } from 'node:net';
+
+import { createPreviews, isOurServer, ownAddresses, portFree, type PreviewDeps, type StartedPreview } from '../src/service/preview-servers.ts';
 import { parseServeSimProcesses, processesFor } from '../src/service/serve-sim-processes.ts';
 import { serveSimsDoubled } from '../src/shared/state.ts';
 
@@ -171,6 +173,58 @@ describe('starting preview servers', () => {
     });
     await expect(previews.start('127.0.0.1', PHONE)).rejects.toThrow('did not answer');
     expect(killed).toEqual([]);
+  });
+
+  test('a failed start that cannot be checked stays on record, so Stop can end it later', async () => {
+    const { deps, killed, record } = world({ answerAfter: Number.POSITIVE_INFINITY });
+    let psWorks = false;
+    const previews = createPreviews({
+      ...deps,
+      commandOf: async (pid) => {
+        if (!psWorks) throw new Error('ps timed out');
+        return deps.commandOf(pid);
+      },
+    });
+    await expect(previews.start('127.0.0.1', PHONE)).rejects.toThrow('did not answer');
+    expect(killed).toEqual([]);
+    expect(record().map((entry) => entry.url)).toEqual(['http://127.0.0.1:3200']);
+    psWorks = true;
+    await previews.stop('http://127.0.0.1:3200');
+    expect(killed).toEqual([501]);
+    expect(record()).toEqual([]);
+  });
+
+  test('Stop of a server that is already gone succeeds and leaves a newer entry alone', async () => {
+    const { deps, record, living } = world();
+    const previews = createPreviews(deps);
+    const old = await previews.start('127.0.0.1', PHONE);
+    living.delete(old.pid);
+    const newer = { pid: 777, url: 'http://127.0.0.1:3201', udid: PHONE };
+    deps.writeRecord([...record(), newer]);
+    await previews.stop(old.url);
+    expect(record()).toEqual([newer]);
+  });
+
+  test('the checked record is reused for a second and forgotten on every write', async () => {
+    const { deps } = world();
+    let checks = 0;
+    const previews = createPreviews({ ...deps, commandOf: async (pid) => ((checks += 1), deps.commandOf(pid)) });
+    const entry = await previews.start('127.0.0.1', PHONE);
+    checks = 0;
+    await previews.started();
+    await previews.started();
+    expect(checks).toBe(1);
+    await previews.stop(entry.url);
+    expect(await previews.started()).toEqual([]);
+  });
+
+  test('a port in use is busy; a wildcard the machine cannot bind is not', async () => {
+    const holder = createServer();
+    await new Promise<void>((resolve) => holder.listen(0, '127.0.0.1', resolve));
+    const { port } = holder.address() as { port: number };
+    expect(await portFree('127.0.0.1', port)).toBe(false);
+    holder.close();
+    expect(await portFree('203.0.113.9', port)).toBe(false); // not an address of this machine
   });
 
   test('the command line must name the recorded device, address and port', () => {

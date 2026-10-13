@@ -1642,9 +1642,36 @@ var createPreviews = (deps) => {
         return entry;
       }
     }
-    if (await identity(entry) === "ours")
+    const state = await identity(entry);
+    if (state === "ours")
       deps.kill(pid);
+    if (state === "unknown")
+      write([...deps.readRecord().filter((other) => other.url !== entry.url), entry]);
     throw new PreviewError("serve-sim did not answer (log: $TMPDIR/openchamber-ios-simulator-serve-sim.log)", 500);
+  };
+  const stopNow = async (url) => {
+    const recorded = deps.readRecord().find((candidate) => candidate.url === url);
+    if (!recorded)
+      throw new PreviewError("Not a server this extension started", 404);
+    const same = (candidate) => candidate.pid === recorded.pid && candidate.url === recorded.url;
+    const state = await identity(recorded);
+    if (state === "unknown")
+      throw new PreviewError("Could not check the process; try Stop again", 503);
+    if (state === "ours") {
+      deps.kill(recorded.pid);
+      for (const deadline = Date.now() + STOP_WAIT_MS;deps.alive(recorded.pid) && Date.now() < deadline; )
+        await deps.sleep(100);
+      if (deps.alive(recorded.pid))
+        throw new PreviewError("serve-sim is still running; try Stop again", 409);
+    }
+    write(deps.readRecord().filter((candidate) => !same(candidate)));
+  };
+  const queued = (work) => {
+    const run = queue.then(work);
+    queue = run.catch(() => {
+      return;
+    });
+    return run;
   };
   return {
     started,
@@ -1652,29 +1679,9 @@ var createPreviews = (deps) => {
       if (typeof address !== "string" || !deps.addresses().some((own) => own.address === address)) {
         return Promise.reject(new PreviewError("Not an address of this machine", 400));
       }
-      const run = queue.then(() => startNow(address, udid));
-      queue = run.catch(() => {
-        return;
-      });
-      return run;
+      return queued(() => startNow(address, udid));
     },
-    async stop(url) {
-      cache = null;
-      const entry = (await started()).find((candidate) => candidate.url === url);
-      if (!entry)
-        throw new PreviewError("Not a server this extension started", 404);
-      const state = await identity(entry);
-      if (state === "unknown")
-        throw new PreviewError("Could not check the process; try Stop again", 503);
-      if (state === "ours") {
-        deps.kill(entry.pid);
-        for (const deadline = Date.now() + STOP_WAIT_MS;deps.alive(entry.pid) && Date.now() < deadline; )
-          await deps.sleep(100);
-        if (deps.alive(entry.pid))
-          throw new PreviewError("serve-sim is still running; try Stop again", 409);
-      }
-      write(deps.readRecord().filter((candidate) => candidate.url !== entry.url));
-    }
+    stop: (url) => queued(() => stopNow(url))
   };
 };
 var RECORD = join6(tmpdir5(), "openchamber-ios-simulator-previews.json");
