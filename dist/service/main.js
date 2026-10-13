@@ -1584,20 +1584,42 @@ var isOurServer = (entry, command) => {
   const value = (flag) => tokens[tokens.indexOf(flag) + 1];
   return tokens.some((token) => token === "serve-sim" || token.endsWith("/serve-sim")) && tokens.includes(entry.udid) && tokens.includes("--host") && value("--host") === url.hostname && tokens.includes("--port") && value("--port") === url.port;
 };
+var STARTED_CACHE_MS = 1000;
 var createPreviews = (deps) => {
   let queue = Promise.resolve();
-  const started = async () => {
+  let cache = null;
+  const write = (list) => {
+    deps.writeRecord(list);
+    cache = null;
+  };
+  const identity = async (entry) => {
+    if (!deps.alive(entry.pid))
+      return "gone";
+    let command;
+    try {
+      command = await deps.commandOf(entry.pid);
+    } catch {
+      return "unknown";
+    }
+    return isOurServer(entry, command) ? "ours" : "gone";
+  };
+  const check = async () => {
     const list = deps.readRecord();
-    const checked = await Promise.all(list.map(async (entry) => deps.alive(entry.pid) && isOurServer(entry, await deps.commandOf(entry.pid)) ? entry : null));
-    const living = checked.filter((entry) => entry !== null);
-    if (living.length !== list.length)
-      deps.writeRecord(living);
-    return living;
+    const states = await Promise.all(list.map(identity));
+    const gone = new Set(list.filter((_, index) => states[index] === "gone").map((entry) => `${entry.pid} ${entry.url}`));
+    if (gone.size > 0)
+      write(deps.readRecord().filter((entry) => !gone.has(`${entry.pid} ${entry.url}`)));
+    return list.filter((entry) => !gone.has(`${entry.pid} ${entry.url}`));
+  };
+  const started = () => {
+    if (!cache || Date.now() - cache.at > STARTED_CACHE_MS)
+      cache = { at: Date.now(), list: check() };
+    return cache.list;
   };
   const startNow = async (address, udid) => {
     let port = null;
     for (const candidate of PREVIEW_PORTS) {
-      if (await deps.portFree(address, candidate) && await deps.portFree("0.0.0.0", candidate)) {
+      if (await deps.portFree(address, candidate) && await deps.portFree("0.0.0.0", candidate) && await deps.portFree("::", candidate)) {
         port = candidate;
         break;
       }
@@ -1613,14 +1635,15 @@ var createPreviews = (deps) => {
       await deps.sleep(500);
       if (!deps.alive(pid))
         break;
-      const ours = await deps.probe(entry.url, udid) && deps.alive(pid) && isOurServer(entry, await deps.commandOf(pid));
+      const ours = await deps.probe(entry.url, udid) && await identity(entry) === "ours";
       confirmed = ours ? confirmed + 1 : 0;
       if (confirmed >= 2) {
-        deps.writeRecord([...(await started()).filter((other) => other.url !== entry.url), entry]);
+        write([...deps.readRecord().filter((other) => other.url !== entry.url), entry]);
         return entry;
       }
     }
-    deps.kill(pid);
+    if (await identity(entry) === "ours")
+      deps.kill(pid);
     throw new PreviewError("serve-sim did not answer (log: $TMPDIR/openchamber-ios-simulator-serve-sim.log)", 500);
   };
   return {
@@ -1636,16 +1659,21 @@ var createPreviews = (deps) => {
       return run;
     },
     async stop(url) {
-      const list = await started();
-      const entry = list.find((candidate) => candidate.url === url);
+      cache = null;
+      const entry = (await started()).find((candidate) => candidate.url === url);
       if (!entry)
         throw new PreviewError("Not a server this extension started", 404);
-      deps.kill(entry.pid);
-      for (const deadline = Date.now() + STOP_WAIT_MS;deps.alive(entry.pid) && Date.now() < deadline; )
-        await deps.sleep(100);
-      if (deps.alive(entry.pid))
-        throw new PreviewError("serve-sim is still running; try Stop again", 409);
-      deps.writeRecord(deps.readRecord().filter((candidate) => candidate.url !== entry.url));
+      const state = await identity(entry);
+      if (state === "unknown")
+        throw new PreviewError("Could not check the process; try Stop again", 503);
+      if (state === "ours") {
+        deps.kill(entry.pid);
+        for (const deadline = Date.now() + STOP_WAIT_MS;deps.alive(entry.pid) && Date.now() < deadline; )
+          await deps.sleep(100);
+        if (deps.alive(entry.pid))
+          throw new PreviewError("serve-sim is still running; try Stop again", 409);
+      }
+      write(deps.readRecord().filter((candidate) => candidate.url !== entry.url));
     }
   };
 };
@@ -1660,7 +1688,7 @@ var readRecord = () => {
 };
 var portFree = (address, port) => new Promise((resolve) => {
   const server = createServer();
-  server.once("error", () => resolve(false));
+  server.once("error", (cause) => resolve(cause.code !== "EADDRINUSE" && (address === "::" || address === "0.0.0.0")));
   server.listen(port, address, () => server.close(() => resolve(true)));
 });
 var launch = (udid, address, port) => {
@@ -1674,22 +1702,27 @@ var launch = (udid, address, port) => {
   child.unref();
   return child.pid;
 };
+var alive = (pid) => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
 var previewDeps = (probe) => ({
   addresses: () => ownAddresses(),
   portFree,
   launch,
   probe,
-  alive: (pid) => {
-    try {
-      process.kill(pid, 0);
-      return true;
-    } catch {
-      return false;
-    }
-  },
+  alive,
   commandOf: async (pid) => {
     const result = await run(PS, ["-p", String(pid), "-o", "command="], { timeout: 5000 });
-    return result.ok && result.stdout.trim() ? result.stdout.trim() : null;
+    if (result.ok)
+      return result.stdout.trim() || null;
+    if (!alive(pid))
+      return null;
+    throw new Error(`ps failed: ${result.missing ? "not found" : result.stderr.trim()}`);
   },
   kill: (pid) => {
     try {
@@ -2410,11 +2443,13 @@ var createSimulator = (ownPreviewPids = async () => new Set) => {
     }
     return found;
   };
-  let bootedCheck = null;
-  const bootedNow = async (udid) => {
-    bootedCheck ??= refreshDevices(Date.now() - devicesAt > 1000).finally(() => setTimeout(() => bootedCheck = null, 1000));
-    return (await bootedCheck).some((device) => device.udid === udid && device.state === "Booted");
+  let listCheck = null;
+  const recentDevices = () => {
+    if (!listCheck || Date.now() - listCheck.at > 1000)
+      listCheck = { at: Date.now(), list: refreshDevices(true) };
+    return listCheck.list;
   };
+  const bootedNow = async (udid) => (await recentDevices()).some((device) => device.udid === udid && device.state === "Booted");
   const links = createLinks({
     now: () => Date.now(),
     graceMs: VIEWER_GRACE_MS2,
@@ -2488,6 +2523,9 @@ var createSimulator = (ownPreviewPids = async () => new Set) => {
         links.peek(udid)?.start();
     for (const udid of links.sweep())
       helperPorts.delete(udid);
+    for (const udid of hubs.keys())
+      if (!devices.some((device) => device.udid === udid) && !links.peek(udid))
+        hubs.delete(udid);
   };
   const watch = async () => {
     if (watching)
@@ -2652,7 +2690,7 @@ var createSimulator = (ownPreviewPids = async () => new Set) => {
     async knows(udid) {
       if (!/^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/.test(udid))
         return false;
-      return (await refreshDevices(Date.now() - devicesAt > 1000)).some((device) => device.udid === udid);
+      return (await recentDevices()).some((device) => device.udid === udid);
     },
     device: (udid) => devices.find((device) => device.udid === udid) ?? null,
     async booted() {

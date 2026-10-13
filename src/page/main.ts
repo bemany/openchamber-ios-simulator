@@ -390,6 +390,10 @@ const createTile = (initial: string) => {
     setUdid(next: string) {
       if (next === udid) return;
       udid = next;
+      // Input still queued was meant for the old device and its size.
+      queue = [];
+      lastSize = null;
+      touching = false;
       shown = null;
       chrome = null;
       chromeKey = '';

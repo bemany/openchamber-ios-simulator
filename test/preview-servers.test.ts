@@ -126,6 +126,53 @@ describe('starting preview servers', () => {
     expect(launched).toEqual([`${PHONE} 100.64.1.2:3201`]);
   });
 
+  test('a failed process check keeps the entry; it is not forgotten', async () => {
+    const { deps, record } = world();
+    const previews = createPreviews(deps);
+    const entry = await previews.start('127.0.0.1', PHONE);
+    const checks = createPreviews({ ...deps, commandOf: async () => { throw new Error('ps timed out'); } });
+    expect(await checks.started()).toEqual([entry]);
+    expect(record()).toEqual([entry]);
+    await expect(checks.stop(entry.url)).rejects.toMatchObject({ status: 503 });
+  });
+
+  test('pruning a gone entry keeps one a start added meanwhile', async () => {
+    const { deps, record } = world();
+    deps.writeRecord([{ pid: 4242, url: 'http://127.0.0.1:3209', udid: PHONE }]);
+    let release = () => undefined as void;
+    const slow = new Promise<void>((resolve) => (release = resolve));
+    const previews = createPreviews({
+      ...deps,
+      alive: (pid) => pid === 4242 || deps.alive(pid),
+      commandOf: async (pid) => {
+        if (pid === 4242) {
+          await slow;
+          return 'something else';
+        }
+        return deps.commandOf(pid);
+      },
+    });
+    const checking = previews.started();
+    const entry = await createPreviews(deps).start('127.0.0.1', PHONE);
+    release();
+    await checking;
+    expect(record()).toEqual([entry]);
+  });
+
+  test('a failed start never ends a pid that now runs something else', async () => {
+    const { deps, killed, commands } = world({ answerAfter: Number.POSITIVE_INFINITY });
+    const previews = createPreviews({
+      ...deps,
+      launch: (udid, address, port) => {
+        const pid = deps.launch(udid, address, port)!;
+        commands.set(pid, '/usr/bin/unrelated');
+        return pid;
+      },
+    });
+    await expect(previews.start('127.0.0.1', PHONE)).rejects.toThrow('did not answer');
+    expect(killed).toEqual([]);
+  });
+
   test('the command line must name the recorded device, address and port', () => {
     const entry = { pid: 1, url: 'http://100.64.1.2:3200', udid: PHONE };
     expect(isOurServer(entry, `node /opt/homebrew/bin/serve-sim ${PHONE} --host 100.64.1.2 --port 3200 --exit-on-simulator-shutdown`)).toBe(true);

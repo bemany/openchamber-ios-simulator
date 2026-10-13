@@ -75,12 +75,19 @@ export const createSimulator = (ownPreviewPids: () => Promise<ReadonlySet<number
     }
     return found;
   };
-  /** At most one forced device list per second for links asking whether their device runs. */
-  let bootedCheck: Promise<Device[]> | null = null;
-  const bootedNow = async (udid: string): Promise<boolean> => {
-    bootedCheck ??= refreshDevices(Date.now() - devicesAt > 1_000).finally(() => setTimeout(() => (bootedCheck = null), 1_000));
-    return (await bootedCheck).some((device) => device.udid === udid && device.state === 'Booted');
+  /**
+   * A fresh device list for checks (links asking whether their device runs,
+   * unknown udids from page tiles): at most one `simctl list` per second,
+   * shared by everyone asking meanwhile, whether it worked or not. A device
+   * created within that second is found a second later.
+   */
+  let listCheck: { at: number; list: Promise<Device[]> } | null = null;
+  const recentDevices = (): Promise<Device[]> => {
+    if (!listCheck || Date.now() - listCheck.at > 1_000) listCheck = { at: Date.now(), list: refreshDevices(true) };
+    return listCheck.list;
   };
+  const bootedNow = async (udid: string): Promise<boolean> =>
+    (await recentDevices()).some((device) => device.udid === udid && device.state === 'Booted');
   const links: Links<DeviceLink> = createLinks<DeviceLink>({
     now: () => Date.now(),
     graceMs: VIEWER_GRACE_MS,
@@ -150,6 +157,8 @@ export const createSimulator = (ownPreviewPids: () => Promise<ReadonlySet<number
     }
     for (const udid of links.watched()) if (booted(udid)) void links.peek(udid)?.start();
     for (const udid of links.sweep()) helperPorts.delete(udid);
+    // Deleted devices: their last picture is not kept forever.
+    for (const udid of hubs.keys()) if (!devices.some((device) => device.udid === udid) && !links.peek(udid)) hubs.delete(udid);
   };
 
   /** Runs while anyone watches: notices device changes and (re)connects streams. */
@@ -338,7 +347,7 @@ export const createSimulator = (ownPreviewPids: () => Promise<ReadonlySet<number
     async knows(udid: string): Promise<boolean> {
       if (!/^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$/.test(udid)) return false;
       // A tile of a deleted device asks on every frame: a fresh list at most once a second.
-      return (await refreshDevices(Date.now() - devicesAt > 1_000)).some((device) => device.udid === udid);
+      return (await recentDevices()).some((device) => device.udid === udid);
     },
 
     /** A listed device by udid, from the last device list. */

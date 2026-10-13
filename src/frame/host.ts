@@ -83,7 +83,11 @@ export const startFrame = (render: (context: FrameContext) => void, options: Fra
   /** The device the toolbar is about now (the page's focused tile), `null` for the panel's. */
   const targetNow = () => options.target?.() ?? null;
 
+  /** Only the newest poll's answer is drawn. */
+  let pollSeq = 0;
+
   async function poll() {
+    const mine = ++pollSeq;
     const asked = targetNow();
     let next: ViewState;
     try {
@@ -93,7 +97,8 @@ export const startFrame = (render: (context: FrameContext) => void, options: Fra
     } catch (cause) {
       next = blockedReason(cause);
     }
-    // The focus moved while this was on its way: the answer is about another device.
+    // A newer poll is on its way, or the focus moved meanwhile: this answer is outdated.
+    if (mine !== pollSeq) return;
     if (asked !== targetNow()) return void poll();
     view = next;
     draw();
@@ -119,6 +124,7 @@ export const startFrame = (render: (context: FrameContext) => void, options: Fra
     } finally {
       pending = null;
     }
+    // (A blocked view stays until the poll below: it is about the service, not a device.)
     await poll();
   }
 
